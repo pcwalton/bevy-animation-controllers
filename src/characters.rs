@@ -13,7 +13,9 @@ use bevy::{
 use std::{any, time::Duration};
 
 use crate::{
-    retargeting::{RetargetedAnimation, RetargetedAnimationNodes, RetargetedAnimations}, AnimationAction, AnimationBlend, AnimationController, AnimationGroup, PlayingAnimation
+    AnimationAction, AnimationBlend, AnimationBlendTime, AnimationController, AnimationGroup,
+    PlayingAnimation,
+    retargeting::{RetargetedAnimation, RetargetedAnimationNodes, RetargetedAnimations},
 };
 
 pub trait AnimatedCharacter: Component {
@@ -84,13 +86,13 @@ pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>
                 continue;
             };
             let Some(RetargetedAnimation { nodes, repeat }) =
-                retargeted_animations.get(&(group, new_animation_blend.tag()))
+                retargeted_animations.get(&(group, new_animation_blend.asset_id()))
             else {
                 warn!(
                     "Couldn't find animation for {:?}, group {:?}, tag {:?}",
                     any::type_name::<A>(),
                     group,
-                    new_animation_blend.tag()
+                    new_animation_blend.asset_id()
                 );
                 continue;
             };
@@ -102,18 +104,24 @@ pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>
             );
 
             let playing_animation = match (new_animation_blend, nodes) {
-                (AnimationBlend::Single(_), RetargetedAnimationNodes::Single(node_index)) => {
+                (AnimationBlend::Single { .. }, RetargetedAnimationNodes::Single(node_index)) => {
                     PlayingAnimation::Single(*node_index)
                 }
                 (
-                    AnimationBlend::Blend1d { blend: _, time },
+                    AnimationBlend::Blend {
+                        blend: _,
+                        time: AnimationBlendTime::Blend1d(time),
+                    },
                     RetargetedAnimationNodes::Blend1d(blend),
                 ) => PlayingAnimation::Blend1d {
                     blend: (*blend).clone(),
                     time,
                 },
                 (
-                    AnimationBlend::Blend2d { blend: _, time },
+                    AnimationBlend::Blend {
+                        blend: _,
+                        time: AnimationBlendTime::Blend2d(time),
+                    },
                     RetargetedAnimationNodes::Blend2d(blend),
                 ) => PlayingAnimation::Blend2d {
                     blend: (*blend).clone(),

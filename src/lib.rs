@@ -3,25 +3,25 @@
 use crate::{
     math::InterpolationResult,
     retargeting::{
-        AnimationsRetargetedEvent, RetargetedAnimationBlend1d, RetargetedAnimationBlend2d,
-        RetargetedAnimationBlendStop1d, RetargetedAnimationNodes,
+        AnimationAssetId, AnimationsRetargetedEvent, RetargetedAnimationBlend1d,
+        RetargetedAnimationBlend2d, RetargetedAnimationBlendStop1d, RetargetedAnimationNodes,
     },
 };
 
 use bevy::{
     animation::{AnimationClip, AnimationPlayer, RepeatAnimation, graph::AnimationNodeIndex},
     app::{AnimationSystems, App, Plugin, PostUpdate, PreUpdate, Update},
-    asset::{AssetId, Handle},
+    asset::{Asset, AssetApp, AssetId, Handle},
     ecs::{component::Component, schedule::IntoScheduleConfigs as _, system::Res},
     log::{error, info, trace, warn},
     math::Vec2,
-    prelude::{Deref, DerefMut, Query},
+    prelude::{Deref, DerefMut, Query, ReflectDeserialize, ReflectSerialize},
     reflect::Reflect,
     time::Time,
 };
-use by_address::ByAddress;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use smallvec::{SmallVec, smallvec};
-use std::{cmp::Ordering, f32::consts::PI, ops::Range, sync::Arc, time::Duration};
+use std::{cmp::Ordering, f32::consts::PI, ops::Range, time::Duration};
 
 pub mod characters;
 pub mod math;
@@ -79,61 +79,57 @@ pub struct AnimationTransition {
 #[derive(Clone, Copy, Reflect, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Deref, DerefMut)]
 pub struct AnimationGroup(pub u32);
 
-pub enum AnimationBlend {
-    Single(AssetId<AnimationClip>),
+#[derive(Clone, Asset, Reflect, Serialize, Deserialize)]
+#[reflect(Serialize, Deserialize)]
+pub struct AnimationBlendAsset {
+    #[serde(flatten)]
+    pub blend_type: AnimationBlendAssetType,
+}
+
+#[derive(Clone, Reflect, Serialize, Deserialize)]
+#[reflect(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnimationBlendAssetType {
     Blend1d {
-        blend: ByAddress<Arc<AnimationBlend1d>>,
-        time: f32,
+        stops: Vec<AnimationBlendAssetStop1d>,
     },
     Blend2d {
-        blend: ByAddress<Arc<AnimationBlend2d>>,
-        time: Vec2,
+        center: AnimationBlendAssetClipHandle,
+        rings: Vec<AnimationBlendAssetRing2d>,
     },
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum AnimationTag {
-    Single(AssetId<AnimationClip>),
-    Blend1d(ByAddress<Arc<AnimationBlend1d>>),
-    Blend2d(ByAddress<Arc<AnimationBlend2d>>),
-}
-
-#[derive(Reflect, Deref, DerefMut, Debug)]
-pub struct AnimationBlend1d(pub SmallVec<[AnimationBlendStop1d; INLINE_ANIMATION_BLENDS]>);
-
-#[derive(Reflect, Debug)]
-pub struct AnimationBlend2d {
-    pub center: AssetId<AnimationClip>,
-    pub rings: SmallVec<[AnimationBlendRing2d; INLINE_ANIMATION_RINGS]>,
-}
-
-#[derive(Reflect, Debug)]
-pub struct AnimationBlendStop1d {
-    pub clip: AssetId<AnimationClip>,
+#[derive(Clone, Reflect, Serialize, Deserialize)]
+#[reflect(Serialize, Deserialize)]
+pub struct AnimationBlendAssetStop1d {
+    pub clip: AnimationBlendAssetClipHandle,
     pub time: f32,
 }
 
-#[derive(Reflect, Debug)]
-pub struct AnimationBlendRing2d {
-    pub stops: SmallVec<[AnimationBlendStop1d; INLINE_ANIMATION_BLENDS]>,
+#[derive(Clone, Reflect, Serialize, Deserialize)]
+#[reflect(Serialize, Deserialize)]
+pub struct AnimationBlendAssetRing2d {
+    pub stops: Vec<AnimationBlendAssetStop1d>,
     pub time: f32,
 }
 
-// FIXME: The way this duplicates the above but with handles is extremely ugly…
+#[derive(Clone, Reflect, Debug, Deref, DerefMut)]
+#[reflect(Serialize, Deserialize)]
+pub struct AnimationBlendAssetClipHandle(pub Handle<AnimationClip>);
 
-pub struct AnimationTagHandle {
-    pub tag: AnimationTag,
-    pub handles: SmallVec<[Handle<AnimationClip>; INLINE_ANIMATION_BLENDS]>,
+pub enum AnimationBlend {
+    Single {
+        clip: AssetId<AnimationClip>,
+    },
+    Blend {
+        blend: AssetId<AnimationBlendAsset>,
+        time: AnimationBlendTime,
+    },
 }
 
-#[derive(Deref, DerefMut)]
-pub struct AnimationBlendHandle1d(
-    pub SmallVec<[AnimationBlendStopHandle1d; INLINE_ANIMATION_BLENDS]>,
-);
-
-pub struct AnimationBlendStopHandle1d {
-    pub clip: Handle<AnimationClip>,
-    pub time: f32,
+pub enum AnimationBlendTime {
+    Blend1d(f32),
+    Blend2d(Vec2),
 }
 
 pub struct PlayingAnimationIterator<'a> {
@@ -155,7 +151,8 @@ const INLINE_ANIMATION_RINGS: usize = 2;
 
 impl Plugin for AnimationControllersPlugin {
     fn build(&self, app: &mut App) {
-        app.add_message::<AnimationsRetargetedEvent>()
+        app.init_asset::<AnimationBlendAsset>()
+            .add_message::<AnimationsRetargetedEvent>()
             .add_systems(PreUpdate, retargeting::prepare_retargeting)
             .add_systems(Update, retargeting::retarget_animations)
             .add_systems(
@@ -425,28 +422,6 @@ impl AnimationGroupController {
     }
 }
 
-impl AnimationBlend {
-    fn tag(&self) -> AnimationTag {
-        match *self {
-            AnimationBlend::Single(clip) => AnimationTag::Single(clip),
-            AnimationBlend::Blend1d { ref blend, .. } => AnimationTag::Blend1d((*blend).clone()),
-            AnimationBlend::Blend2d { ref blend, .. } => AnimationTag::Blend2d((*blend).clone()),
-        }
-    }
-}
-
-impl From<AssetId<AnimationClip>> for AnimationTag {
-    fn from(clip: AssetId<AnimationClip>) -> Self {
-        AnimationTag::Single(clip)
-    }
-}
-
-impl From<AssetId<AnimationClip>> for AnimationBlend {
-    fn from(clip: AssetId<AnimationClip>) -> Self {
-        AnimationBlend::Single(clip)
-    }
-}
-
 impl PlayingAnimation {
     fn iter(&self) -> PlayingAnimationIterator {
         PlayingAnimationIterator {
@@ -512,38 +487,6 @@ impl PlayingAnimation {
                     time: Vec2::ZERO,
                 }
             }
-        }
-    }
-}
-
-impl AnimationBlendStopHandle1d {
-    pub fn new(clip: Handle<AnimationClip>, time: f32) -> Self {
-        Self { clip, time }
-    }
-}
-
-impl AnimationBlendStop1d {
-    pub fn new(clip: AssetId<AnimationClip>, time: f32) -> Self {
-        Self { clip, time }
-    }
-}
-
-impl AnimationTagHandle {
-    pub fn new(
-        tag: AnimationTag,
-        handles: SmallVec<[Handle<AnimationClip>; INLINE_ANIMATION_BLENDS]>,
-    ) -> Self {
-        Self { tag, handles }
-    }
-}
-
-impl From<Handle<AnimationClip>> for AnimationTagHandle {
-    // Convenience function for making an `AnimationTagHandle::Single` from a
-    // `Handle<AnimationClip>`.
-    fn from(clip: Handle<AnimationClip>) -> Self {
-        AnimationTagHandle {
-            tag: AnimationTag::Single(clip.id()),
-            handles: smallvec![clip],
         }
     }
 }
@@ -786,5 +729,77 @@ pub fn expire_completed_transitions(
                 !expire
             });
         }
+    }
+}
+
+impl Serialize for AnimationBlendAssetClipHandle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AnimationBlendAssetClipHandle {
+    fn deserialize<D>(_: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Err(de::Error::custom("TODO"))
+    }
+}
+
+impl AnimationBlend {
+    fn asset_id(&self) -> AnimationAssetId {
+        match *self {
+            AnimationBlend::Single { clip } => AnimationAssetId::Single(clip),
+            AnimationBlend::Blend { blend, time: _ } => AnimationAssetId::Blend(blend),
+        }
+    }
+}
+
+impl AnimationBlendAssetStop1d {
+    pub fn new(clip: Handle<AnimationClip>, time: f32) -> Self {
+        Self {
+            clip: AnimationBlendAssetClipHandle(clip),
+            time,
+        }
+    }
+}
+
+impl From<Handle<AnimationClip>> for AnimationBlendAssetClipHandle {
+    fn from(clip: Handle<AnimationClip>) -> Self {
+        AnimationBlendAssetClipHandle(clip)
+    }
+}
+
+impl From<AssetId<AnimationClip>> for AnimationAssetId {
+    fn from(clip_id: AssetId<AnimationClip>) -> Self {
+        AnimationAssetId::Single(clip_id)
+    }
+}
+
+impl From<AssetId<AnimationBlendAsset>> for AnimationAssetId {
+    fn from(blend_id: AssetId<AnimationBlendAsset>) -> Self {
+        AnimationAssetId::Blend(blend_id)
+    }
+}
+
+impl From<f32> for AnimationBlendTime {
+    fn from(time: f32) -> Self {
+        AnimationBlendTime::Blend1d(time)
+    }
+}
+
+impl From<Vec2> for AnimationBlendTime {
+    fn from(time: Vec2) -> Self {
+        AnimationBlendTime::Blend2d(time)
+    }
+}
+
+impl From<AssetId<AnimationClip>> for AnimationBlend {
+    fn from(clip: AssetId<AnimationClip>) -> Self {
+        AnimationBlend::Single { clip }
     }
 }

@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 arrayvec = "0.7"
 bevy = "0.17"
-by_address = "1"
+serde = "1"
 smallvec = "1"
+toml = "0.9"

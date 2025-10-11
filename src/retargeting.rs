@@ -6,7 +6,7 @@ use bevy::{
         AnimationClip, AnimationPlayer, AnimationTarget, AnimationTargetId, RepeatAnimation,
         graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
     },
-    asset::{AssetServer, Assets, Handle},
+    asset::{AssetId, AssetServer, Assets, Handle},
     ecs::{
         component::Component,
         entity::Entity,
@@ -27,8 +27,8 @@ use smallvec::{SmallVec, smallvec};
 use std::iter;
 
 use crate::{
-    AnimationBlend2d, AnimationGroup, AnimationTag, AnimationTagHandle, INLINE_ANIMATION_BLENDS,
-    INLINE_ANIMATION_RINGS, math::InterpolationPoint1d,
+    AnimationBlendAsset, AnimationBlendAssetRing2d, AnimationBlendAssetType, AnimationGroup,
+    INLINE_ANIMATION_BLENDS, INLINE_ANIMATION_RINGS, math::InterpolationPoint1d,
 };
 
 /// Fired when all animations for an entity have been retargeted.
@@ -36,12 +36,18 @@ use crate::{
 pub struct AnimationsRetargetedEvent(pub Entity);
 
 pub struct AnimationRetargetGroup {
-    pub animations: Vec<(AnimationTagHandle, RepeatAnimation)>,
+    pub animations: Vec<(AnimationAssetId, RepeatAnimation)>,
     pub graph_node: AnimationNodeIndex,
 }
 
+#[derive(Clone, PartialEq, PartialOrd, Eq, Hash, Debug)]
+pub enum AnimationAssetId {
+    Single(AssetId<AnimationClip>),
+    Blend(AssetId<AnimationBlendAsset>),
+}
+
 #[derive(Clone, Component, Default, Deref, DerefMut)]
-pub struct RetargetedAnimations(HashMap<(AnimationGroup, AnimationTag), RetargetedAnimation>);
+pub struct RetargetedAnimations(HashMap<(AnimationGroup, AnimationAssetId), RetargetedAnimation>);
 
 #[derive(Clone, Reflect)]
 pub struct RetargetedAnimation {
@@ -106,6 +112,8 @@ pub fn retarget_animations(
         With<AnimationPlayer>,
     >,
     mut animation_graph_assets: ResMut<Assets<AnimationGraph>>,
+    animation_blend_assets: Res<Assets<AnimationBlendAsset>>,
+    mut animation_clip_assets: ResMut<Assets<AnimationClip>>,
     asset_server: Res<AssetServer>,
     mut animations_retargeted_events: MessageWriter<AnimationsRetargetedEvent>,
 ) {
@@ -119,18 +127,19 @@ pub fn retarget_animations(
                     .get_mut(animation_graph.id())
                     .expect("Animation graph wasn't loaded");
 
-                match &clip.tag {
-                    AnimationTag::Single(_) => {
-                        let clip_handle = clip.handles[0].clone();
-                        if !asset_server.is_loaded_with_dependencies(clip_handle.id()) {
+                match *clip {
+                    AnimationAssetId::Single(clip_id) => {
+                        if !asset_server.is_loaded_with_dependencies(clip_id) {
                             return true;
                         }
 
+                        let Some(clip_handle) =
+                            animation_clip_assets.get_strong_handle(clip_id) else { return true };
                         let clip_node_index =
                             animation_graph.add_clip(clip_handle.clone(), 1.0, group.graph_node);
 
                         retargeted_animations.insert(
-                            (group_index, clip_handle.id().into()),
+                            (group_index, AnimationAssetId::Single(clip_id)),
                             RetargetedAnimation {
                                 nodes: RetargetedAnimationNodes::Single(clip_node_index),
                                 repeat: *repeat,
@@ -138,50 +147,56 @@ pub fn retarget_animations(
                         );
                     }
 
-                    AnimationTag::Blend1d(blend) => {
-                        if !blend
-                            .iter()
-                            .all(|stop| asset_server.is_loaded_with_dependencies(stop.clip))
-                        {
-                            return true;
-                        }
+                    AnimationAssetId::Blend(blend_asset_id) => {
+                        let Some(blend_asset) = animation_blend_assets.get(blend_asset_id) else {
+                            return false;
+                        };
+                        match &blend_asset.blend_type {
+                            AnimationBlendAssetType::Blend1d { stops } => {
+                                if !stops.iter().all(|stop| {
+                                    asset_server.is_loaded_with_dependencies(
+                                        stop.clip.id().untyped()
+                                    )
+                                }) {
+                                    return true;
+                                }
 
-                        let blend_node_index = animation_graph.add_blend(1.0, group.graph_node);
+                                let blend_node_index =
+                                    animation_graph.add_blend(1.0, group.graph_node);
 
-                        let mut retargeted_stops = SmallVec::new();
-                        for (input_stop, input_stop_clip) in blend.iter().zip(clip.handles.iter()) {
-                            let node = animation_graph.add_clip(
-                                input_stop_clip.clone(),
-                                1.0,
-                                blend_node_index,
-                            );
-                            retargeted_stops.push(RetargetedAnimationBlendStop1d {
-                                node,
-                                time: input_stop.time,
-                            });
-                        }
+                                let mut retargeted_stops = SmallVec::new();
+                                for input_stop in stops {
+                                    let node = animation_graph.add_clip(
+                                        input_stop.clip.0.clone(),
+                                        1.0,
+                                        blend_node_index,
+                                    );
+                                    retargeted_stops.push(RetargetedAnimationBlendStop1d {
+                                        node,
+                                        time: input_stop.time,
+                                    });
+                                }
 
-                        retargeted_animations.insert(
-                            (group_index, AnimationTag::Blend1d(blend.clone())),
-                            RetargetedAnimation {
-                                nodes: RetargetedAnimationNodes::Blend1d(
-                                    RetargetedAnimationBlend1d(retargeted_stops),
-                                ),
-                                repeat: *repeat,
-                            },
-                        );
-                    }
+                                retargeted_animations.insert(
+                                    (group_index, AnimationAssetId::Blend(blend_asset_id)),
+                                    RetargetedAnimation {
+                                        nodes: RetargetedAnimationNodes::Blend1d(
+                                            RetargetedAnimationBlend1d(retargeted_stops),
+                                        ),
+                                        repeat: *repeat,
+                                    },
+                                );
+                            }
 
-                    AnimationTag::Blend2d(blend) => {
-                        if !iter::once(blend.center)
+                            AnimationBlendAssetType::Blend2d { center, rings } => {
+                        if !iter::once(center.clone())
                             .chain(
-                                blend
-                                    .rings
+                                    rings
                                     .iter()
                                     .flat_map(|ring| ring.stops.iter())
-                                    .map(|stop| stop.clip),
+                                    .map(|stop| stop.clip.clone()),
                             )
-                            .all(|clip| asset_server.is_loaded_with_dependencies(clip))
+                            .all(|clip| asset_server.is_loaded_with_dependencies(clip.id().untyped()))
                         {
                             return true;
                         }
@@ -189,22 +204,25 @@ pub fn retarget_animations(
                         match create_retargeted_animation_for_2d_blend(
                             animation_graph,
                             group.graph_node,
-                            blend,
-                            clip.handles.iter(),
+                            center.id(),
+                            rings,
                             repeat,
+                            &mut animation_clip_assets,
                         ) {
                             None => {
                                 error!(
                                     "Mismatch between the number of clip handles for 2D blend \
                                      with center clip {:?}",
-                                    blend.center
+                                    center
                                 );
                             }
                             Some(retargeted_animation) => {
                                 retargeted_animations.insert(
-                                    (group_index, AnimationTag::Blend2d(blend.clone())),
+                                    (group_index, clip.clone()),
                                     retargeted_animation,
                                 );
+                            }
+                        }
                             }
                         }
                     }
@@ -225,25 +243,33 @@ pub fn retarget_animations(
     }
 }
 
-fn create_retargeted_animation_for_2d_blend<'a>(
+fn create_retargeted_animation_for_2d_blend(
     animation_graph: &mut AnimationGraph,
     animation_graph_blend_node: AnimationNodeIndex,
-    blend: &AnimationBlend2d,
-    mut clip_handles: impl Iterator<Item = &'a Handle<AnimationClip>>,
+    center: AssetId<AnimationClip>,
+    rings: &[AnimationBlendAssetRing2d],
     repeat: &RepeatAnimation,
+    animation_clip_assets: &mut Assets<AnimationClip>,
 ) -> Option<RetargetedAnimation> {
     let blend_node_index = animation_graph.add_blend(1.0, animation_graph_blend_node);
 
     let mut retargeted_rings = SmallVec::new();
     let mut retargeted_stops = smallvec![RetargetedAnimationBlendStop1d {
-        node: animation_graph.add_clip(clip_handles.next()?.clone(), 1.0, blend_node_index),
+        node: animation_graph.add_clip(
+            animation_clip_assets.get_strong_handle(center)?,
+            1.0,
+            blend_node_index
+        ),
         time: 0.0
     }];
-    for input_ring in blend.rings.iter() {
+    for input_ring in rings.iter() {
         let first_stop_index = retargeted_stops.len();
         for input_stop in input_ring.stops.iter() {
-            let node =
-                animation_graph.add_clip(clip_handles.next()?.clone(), 1.0, blend_node_index);
+            let node = animation_graph.add_clip(
+                animation_clip_assets.get_strong_handle(input_stop.clip.id())?,
+                1.0,
+                blend_node_index,
+            );
             retargeted_stops.push(RetargetedAnimationBlendStop1d {
                 node,
                 time: input_stop.time,
