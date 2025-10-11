@@ -1,63 +1,33 @@
 //! Experimental animation controllers for Bevy.
 
-use crate::math::{InterpolationPoint1d, InterpolationResult};
+use crate::{
+    math::InterpolationResult,
+    retargeting::{
+        AnimationsRetargetedEvent, RetargetedAnimationBlend1d, RetargetedAnimationBlend2d,
+        RetargetedAnimationBlendStop1d, RetargetedAnimationNodes,
+    },
+};
 
-use arrayvec::ArrayVec;
 use bevy::{
-    animation::{
-        AnimationClip, AnimationPlayer, AnimationTarget, AnimationTargetId, RepeatAnimation,
-        graph::{AnimationGraphHandle, AnimationNodeIndex},
-    },
+    animation::{AnimationClip, AnimationPlayer, RepeatAnimation, graph::AnimationNodeIndex},
     app::{AnimationSystems, App, Plugin, PostUpdate, PreUpdate, Update},
-    asset::{AssetId, AssetServer, Assets, Handle},
-    ecs::{
-        component::{Component, Mutable},
-        entity::Entity,
-        hierarchy::Children,
-        message::Message,
-        name::Name,
-        schedule::IntoScheduleConfigs as _,
-        system::{Commands, Res, StaticSystemParam, SystemParam},
-    },
-    log::{debug, error, info, trace, warn},
+    asset::{AssetId, Handle},
+    ecs::{component::Component, schedule::IntoScheduleConfigs as _, system::Res},
+    log::{error, info, trace, warn},
     math::Vec2,
-    platform::collections::HashMap,
-    prelude::{AnimationGraph, Deref, DerefMut, Gltf, MessageWriter, Query, ResMut, With},
+    prelude::{Deref, DerefMut, Query},
     reflect::Reflect,
-    scene::SceneRoot,
     time::Time,
 };
 use by_address::ByAddress;
 use smallvec::{SmallVec, smallvec};
-use std::{any, cmp::Ordering, f32::consts::PI, iter, ops::Range, sync::Arc, time::Duration};
+use std::{cmp::Ordering, f32::consts::PI, ops::Range, sync::Arc, time::Duration};
 
+pub mod characters;
 pub mod math;
+pub mod retargeting;
 
 pub struct AnimationControllersPlugin;
-
-pub trait AnimatedCharacter: Component {
-    type AnimationState;
-    type SystemParam: SystemParam;
-
-    const GROUP_COUNT: u32;
-
-    fn compute_new_animation_state(
-        &self,
-        entity: Entity,
-        param: &StaticSystemParam<'_, '_, Self::SystemParam>,
-    ) -> Self::AnimationState;
-    fn compute_animation_action(
-        &self,
-        group: AnimationGroup,
-        new_state: &Self::AnimationState,
-    ) -> AnimationAction;
-    fn animation_for_state(
-        group: AnimationGroup,
-        state: &Self::AnimationState,
-        param: &StaticSystemParam<'_, '_, Self::SystemParam>,
-    ) -> (Option<AnimationBlend>, Duration);
-    fn set_current_animation_state(&mut self, new_state: &Self::AnimationState);
-}
 
 /// How a character animation transition should occur.
 #[derive(Clone, Copy, PartialEq, Reflect, Debug)]
@@ -166,68 +136,6 @@ pub struct AnimationBlendStopHandle1d {
     pub time: f32,
 }
 
-/// Fired when all animations for an entity have been retargeted.
-#[derive(Message, Reflect, Deref, DerefMut)]
-pub struct AnimationsRetargetedEvent(pub Entity);
-
-pub struct AnimationRetargetGroup {
-    pub animations: Vec<(AnimationTagHandle, RepeatAnimation)>,
-    pub graph_node: AnimationNodeIndex,
-}
-
-#[derive(Clone, Component, Default, Deref, DerefMut)]
-pub struct RetargetedAnimations(HashMap<(AnimationGroup, AnimationTag), RetargetedAnimation>);
-
-#[derive(Clone, Reflect)]
-pub struct RetargetedAnimation {
-    pub nodes: RetargetedAnimationNodes,
-    pub repeat: RepeatAnimation,
-}
-
-#[derive(Clone, Reflect, Debug)]
-pub enum RetargetedAnimationNodes {
-    Single(AnimationNodeIndex),
-    Blend1d(RetargetedAnimationBlend1d),
-    Blend2d(RetargetedAnimationBlend2d),
-}
-
-#[derive(Clone, PartialEq, Reflect, Debug, Deref, DerefMut)]
-pub struct RetargetedAnimationBlend1d(
-    pub SmallVec<[RetargetedAnimationBlendStop1d; INLINE_ANIMATION_BLENDS]>,
-);
-
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub struct RetargetedAnimationBlendStop1d {
-    pub node: AnimationNodeIndex,
-    pub time: f32,
-}
-
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub struct RetargetedAnimationBlend2d {
-    pub stops: SmallVec<[RetargetedAnimationBlendStop1d; INLINE_ANIMATION_BLENDS]>,
-    pub rings: SmallVec<[RetargetedAnimationBlendRing2d; INLINE_ANIMATION_RINGS]>,
-}
-
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub struct RetargetedAnimationBlendRing2d {
-    pub first_stop_index: usize,
-    pub time: f32,
-}
-
-#[derive(Component, Reflect)]
-pub struct AnimationRetargeter {
-    #[reflect(ignore)]
-    pub groups: Vec<AnimationRetargetGroup>,
-    pub dest_root_joint: Name,
-    /// Whether the animation path should start with the destination root joint.
-    pub include_dest_root_joint_in_path: bool,
-}
-
-#[derive(Reflect)]
-pub struct AnimationRetarget {
-    pub gltf: Handle<Gltf>,
-}
-
 pub struct PlayingAnimationIterator<'a> {
     animation: &'a PlayingAnimation,
     index: usize,
@@ -244,6 +152,20 @@ struct LinearInterpolationWeights {
 const INLINE_ANIMATION_BLENDS: usize = 5;
 
 const INLINE_ANIMATION_RINGS: usize = 2;
+
+impl Plugin for AnimationControllersPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_message::<AnimationsRetargetedEvent>()
+            .add_systems(PreUpdate, retargeting::prepare_retargeting)
+            .add_systems(Update, retargeting::retarget_animations)
+            .add_systems(
+                PostUpdate,
+                (advance_transitions, expire_completed_transitions)
+                    .before(bevy::animation::animate_targets)
+                    .in_set(AnimationSystems),
+            );
+    }
+}
 
 impl AnimationController {
     pub fn new(group_count: u32) -> AnimationController {
@@ -503,111 +425,6 @@ impl AnimationGroupController {
     }
 }
 
-pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>(
-    mut q_characters: Query<(Entity, &mut A, &Children)>,
-    mut q_rigs: Query<(
-        &mut AnimationController,
-        &mut AnimationPlayer,
-        &RetargetedAnimations,
-    )>,
-    param: StaticSystemParam<A::SystemParam>,
-) {
-    for (entity, mut animated_character, children) in &mut q_characters {
-        let Some(rig) = children.iter().cloned().find(|&kid| q_rigs.contains(kid)) else {
-            error!(
-                "Couldn't find character meshes for {:?}",
-                any::type_name::<A>()
-            );
-            continue;
-        };
-        let Ok((mut animation_controller, mut animation_player, retargeted_animations)) =
-            q_rigs.get_mut(rig)
-        else {
-            error!(
-                "Couldn't find a necessary animation component for {:?}",
-                any::type_name::<A>()
-            );
-            continue;
-        };
-
-        let new_animation_state = animated_character.compute_new_animation_state(entity, &param);
-        let mut any_dirty = false;
-        for group in 0..A::GROUP_COUNT {
-            let group = AnimationGroup(group);
-            let animation_action =
-                animated_character.compute_animation_action(group, &new_animation_state);
-            if animation_action == AnimationAction::NoChange {
-                continue;
-            }
-            any_dirty = true;
-
-            let (Some(new_animation_blend), animation_transition_time) =
-                A::animation_for_state(group, &new_animation_state, &param)
-            else {
-                continue;
-            };
-            let Some(RetargetedAnimation { nodes, repeat }) =
-                retargeted_animations.get(&(group, new_animation_blend.tag()))
-            else {
-                warn!(
-                    "Couldn't find animation for {:?}, group {:?}, tag {:?}",
-                    any::type_name::<A>(),
-                    group,
-                    new_animation_blend.tag()
-                );
-                continue;
-            };
-
-            debug!(
-                "Changing animation for {:?}, group {:?}",
-                any::type_name::<A>(),
-                group
-            );
-
-            let playing_animation = match (new_animation_blend, nodes) {
-                (AnimationBlend::Single(_), RetargetedAnimationNodes::Single(node_index)) => {
-                    PlayingAnimation::Single(*node_index)
-                }
-                (
-                    AnimationBlend::Blend1d { blend: _, time },
-                    RetargetedAnimationNodes::Blend1d(blend),
-                ) => PlayingAnimation::Blend1d {
-                    blend: (*blend).clone(),
-                    time,
-                },
-                (
-                    AnimationBlend::Blend2d { blend: _, time },
-                    RetargetedAnimationNodes::Blend2d(blend),
-                ) => PlayingAnimation::Blend2d {
-                    blend: (*blend).clone(),
-                    time,
-                },
-                _ => {
-                    error!(
-                        "Mismatch between blend and retargeted animation nodes for {:?}, \
-                        group {:?}",
-                        any::type_name::<A>(),
-                        group
-                    );
-                    continue;
-                }
-            };
-
-            animation_controller.group_mut(group).play(
-                &mut animation_player,
-                playing_animation,
-                animation_transition_time,
-                *repeat,
-                animation_action,
-            )
-        }
-
-        if any_dirty {
-            animated_character.set_current_animation_state(&new_animation_state);
-        }
-    }
-}
-
 impl AnimationBlend {
     fn tag(&self) -> AnimationTag {
         match *self {
@@ -728,12 +545,6 @@ impl From<Handle<AnimationClip>> for AnimationTagHandle {
             tag: AnimationTag::Single(clip.id()),
             handles: smallvec![clip],
         }
-    }
-}
-
-impl InterpolationPoint1d for RetargetedAnimationBlendStop1d {
-    fn time(&self) -> f32 {
-        self.time
     }
 }
 
@@ -859,20 +670,6 @@ fn linear_interpolate_ring(
     }
 }
 
-impl Plugin for AnimationControllersPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_message::<AnimationsRetargetedEvent>()
-            .add_systems(PreUpdate, prepare_retargeting)
-            .add_systems(Update, retarget_animations)
-            .add_systems(
-                PostUpdate,
-                (advance_transitions, expire_completed_transitions)
-                    .before(bevy::animation::animate_targets)
-                    .in_set(AnimationSystems),
-            );
-    }
-}
-
 /// A system that alters the weight of currently-playing transitions based on
 /// the current time and decline amount.
 pub fn advance_transitions(
@@ -990,284 +787,4 @@ pub fn expire_completed_transitions(
             });
         }
     }
-}
-
-pub fn prepare_retargeting(
-    mut commands: Commands,
-    q_retargeting_targets: Query<(Entity, &AnimationRetargeter, &SceneRoot)>,
-    q_candidate_targets: Query<(Option<&Name>, Option<&Children>)>,
-    asset_server: Res<AssetServer>,
-) {
-    for (entity, animation_retargeter, target_scene) in &q_retargeting_targets {
-        if !asset_server.is_loaded_with_dependencies(target_scene.id()) {
-            continue;
-        }
-
-        commands.entity(entity).insert(AnimationPlayer::default());
-
-        let debug_name = if cfg!(debug_assertions) {
-            "".to_owned()
-        } else {
-            match asset_server.get_path(target_scene.id()) {
-                Some(asset_path) => format!("{asset_path}"),
-                None => format!("{:?}", target_scene.id()),
-            }
-        };
-
-        search_for_root(
-            &mut commands,
-            &q_candidate_targets,
-            animation_retargeter,
-            entity,
-            entity,
-            &debug_name,
-        );
-    }
-
-    fn search_for_root(
-        commands: &mut Commands,
-        q_candidate_targets: &Query<(Option<&Name>, Option<&Children>)>,
-        animation_retargeter: &AnimationRetargeter,
-        root_entity: Entity,
-        entity: Entity,
-        debug_name: &str,
-    ) {
-        let Ok((maybe_name, maybe_kids)) = q_candidate_targets.get(entity) else {
-            return;
-        };
-
-        let mut path: ArrayVec<_, 1> = ArrayVec::new();
-        if animation_retargeter.include_dest_root_joint_in_path {
-            path.push(animation_retargeter.dest_root_joint.clone());
-        }
-
-        if maybe_name.is_some_and(|name| *name == animation_retargeter.dest_root_joint) {
-            let Some(kids) = maybe_kids else { return };
-            for &kid in kids {
-                add_animation_targets(
-                    commands,
-                    q_candidate_targets,
-                    root_entity,
-                    kid,
-                    &path,
-                    debug_name,
-                );
-            }
-            return;
-        }
-
-        let Some(kids) = maybe_kids else { return };
-        for &kid in kids {
-            search_for_root(
-                commands,
-                q_candidate_targets,
-                animation_retargeter,
-                root_entity,
-                kid,
-                debug_name,
-            );
-        }
-    }
-
-    fn add_animation_targets(
-        commands: &mut Commands,
-        q_candidate_targets: &Query<(Option<&Name>, Option<&Children>)>,
-        root: Entity,
-        entity: Entity,
-        parent_path: &[Name],
-        debug_name: &str,
-    ) {
-        let Ok((Some(name), maybe_kids)) = q_candidate_targets.get(entity) else {
-            return;
-        };
-
-        let path: Vec<Name> = parent_path
-            .iter()
-            .cloned()
-            .chain(iter::once(name.clone()))
-            .collect();
-
-        debug!("Adding animation target for {}: {:?}", debug_name, path);
-
-        commands.entity(entity).insert(AnimationTarget {
-            id: AnimationTargetId::from_names(path.iter()),
-            player: root,
-        });
-
-        let Some(kids) = maybe_kids else { return };
-        for &kid in kids {
-            add_animation_targets(commands, q_candidate_targets, root, kid, &path, debug_name);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn retarget_animations(
-    mut commands: Commands,
-    mut q_retargeting_targets: Query<
-        (
-            Entity,
-            &mut AnimationRetargeter,
-            &mut RetargetedAnimations,
-            &AnimationGraphHandle,
-        ),
-        With<AnimationPlayer>,
-    >,
-    mut animation_graph_assets: ResMut<Assets<AnimationGraph>>,
-    asset_server: Res<AssetServer>,
-    mut animations_retargeted_events: MessageWriter<AnimationsRetargetedEvent>,
-) {
-    for (entity, mut animation_retargeter, mut retargeted_animations, animation_graph) in
-        &mut q_retargeting_targets
-    {
-        for (group_index, group) in animation_retargeter.groups.iter_mut().enumerate() {
-            let group_index = AnimationGroup(group_index as u32);
-            group.animations.retain(|(clip, repeat)| {
-                let animation_graph = animation_graph_assets
-                    .get_mut(animation_graph.id())
-                    .expect("Animation graph wasn't loaded");
-
-                match &clip.tag {
-                    AnimationTag::Single(_) => {
-                        let clip_handle = clip.handles[0].clone();
-                        if !asset_server.is_loaded_with_dependencies(clip_handle.id()) {
-                            return true;
-                        }
-
-                        let clip_node_index =
-                            animation_graph.add_clip(clip_handle.clone(), 1.0, group.graph_node);
-
-                        retargeted_animations.insert(
-                            (group_index, clip_handle.id().into()),
-                            RetargetedAnimation {
-                                nodes: RetargetedAnimationNodes::Single(clip_node_index),
-                                repeat: *repeat,
-                            },
-                        );
-                    }
-
-                    AnimationTag::Blend1d(blend) => {
-                        if !blend
-                            .iter()
-                            .all(|stop| asset_server.is_loaded_with_dependencies(stop.clip))
-                        {
-                            return true;
-                        }
-
-                        let blend_node_index = animation_graph.add_blend(1.0, group.graph_node);
-
-                        let mut retargeted_stops = SmallVec::new();
-                        for (input_stop, input_stop_clip) in blend.iter().zip(clip.handles.iter()) {
-                            let node = animation_graph.add_clip(
-                                input_stop_clip.clone(),
-                                1.0,
-                                blend_node_index,
-                            );
-                            retargeted_stops.push(RetargetedAnimationBlendStop1d {
-                                node,
-                                time: input_stop.time,
-                            });
-                        }
-
-                        retargeted_animations.insert(
-                            (group_index, AnimationTag::Blend1d(blend.clone())),
-                            RetargetedAnimation {
-                                nodes: RetargetedAnimationNodes::Blend1d(
-                                    RetargetedAnimationBlend1d(retargeted_stops),
-                                ),
-                                repeat: *repeat,
-                            },
-                        );
-                    }
-
-                    AnimationTag::Blend2d(blend) => {
-                        if !iter::once(blend.center)
-                            .chain(
-                                blend
-                                    .rings
-                                    .iter()
-                                    .flat_map(|ring| ring.stops.iter())
-                                    .map(|stop| stop.clip),
-                            )
-                            .all(|clip| asset_server.is_loaded_with_dependencies(clip))
-                        {
-                            return true;
-                        }
-
-                        match create_retargeted_animation_for_2d_blend(
-                            animation_graph,
-                            group.graph_node,
-                            blend,
-                            clip.handles.iter(),
-                            repeat,
-                        ) {
-                            None => {
-                                error!(
-                                    "Mismatch between the number of clip handles for 2D blend \
-                                     with center clip {:?}",
-                                    blend.center
-                                );
-                            }
-                            Some(retargeted_animation) => {
-                                retargeted_animations.insert(
-                                    (group_index, AnimationTag::Blend2d(blend.clone())),
-                                    retargeted_animation,
-                                );
-                            }
-                        }
-                    }
-                }
-
-                false
-            });
-        }
-
-        if animation_retargeter
-            .groups
-            .iter()
-            .all(|group| group.animations.is_empty())
-        {
-            commands.entity(entity).remove::<AnimationRetargeter>();
-            animations_retargeted_events.write(AnimationsRetargetedEvent(entity));
-        }
-    }
-}
-
-fn create_retargeted_animation_for_2d_blend<'a>(
-    animation_graph: &mut AnimationGraph,
-    animation_graph_blend_node: AnimationNodeIndex,
-    blend: &AnimationBlend2d,
-    mut clip_handles: impl Iterator<Item = &'a Handle<AnimationClip>>,
-    repeat: &RepeatAnimation,
-) -> Option<RetargetedAnimation> {
-    let blend_node_index = animation_graph.add_blend(1.0, animation_graph_blend_node);
-
-    let mut retargeted_rings = SmallVec::new();
-    let mut retargeted_stops = smallvec![RetargetedAnimationBlendStop1d {
-        node: animation_graph.add_clip(clip_handles.next()?.clone(), 1.0, blend_node_index),
-        time: 0.0
-    }];
-    for input_ring in blend.rings.iter() {
-        let first_stop_index = retargeted_stops.len();
-        for input_stop in input_ring.stops.iter() {
-            let node =
-                animation_graph.add_clip(clip_handles.next()?.clone(), 1.0, blend_node_index);
-            retargeted_stops.push(RetargetedAnimationBlendStop1d {
-                node,
-                time: input_stop.time,
-            })
-        }
-        retargeted_rings.push(RetargetedAnimationBlendRing2d {
-            first_stop_index,
-            time: input_ring.time,
-        });
-    }
-
-    Some(RetargetedAnimation {
-        nodes: RetargetedAnimationNodes::Blend2d(RetargetedAnimationBlend2d {
-            stops: retargeted_stops,
-            rings: retargeted_rings,
-        }),
-        repeat: *repeat,
-    })
 }
