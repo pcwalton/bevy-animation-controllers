@@ -28,7 +28,6 @@ use std::iter;
 
 use crate::{
     AnimationBlendAsset, AnimationBlendAssetRing2d, AnimationBlendAssetType, AnimationGroup,
-    INLINE_ANIMATION_BLENDS, INLINE_ANIMATION_RINGS, math::InterpolationPoint1d,
 };
 
 /// Fired when all animations for an entity have been retargeted.
@@ -51,38 +50,9 @@ pub struct RetargetedAnimations(HashMap<(AnimationGroup, AnimationAssetId), Reta
 
 #[derive(Clone, Reflect)]
 pub struct RetargetedAnimation {
-    pub nodes: RetargetedAnimationNodes,
+    /// A mapping from stop index to animation node index.
+    pub nodes: SmallVec<[AnimationNodeIndex; 1]>,
     pub repeat: RepeatAnimation,
-}
-
-#[derive(Clone, Reflect, Debug)]
-pub enum RetargetedAnimationNodes {
-    Single(AnimationNodeIndex),
-    Blend1d(RetargetedAnimationBlend1d),
-    Blend2d(RetargetedAnimationBlend2d),
-}
-
-#[derive(Clone, PartialEq, Reflect, Debug, Deref, DerefMut)]
-pub struct RetargetedAnimationBlend1d(
-    pub SmallVec<[RetargetedAnimationBlendStop1d; INLINE_ANIMATION_BLENDS]>,
-);
-
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub struct RetargetedAnimationBlendStop1d {
-    pub node: AnimationNodeIndex,
-    pub time: f32,
-}
-
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub struct RetargetedAnimationBlend2d {
-    pub stops: SmallVec<[RetargetedAnimationBlendStop1d; INLINE_ANIMATION_BLENDS]>,
-    pub rings: SmallVec<[RetargetedAnimationBlendRing2d; INLINE_ANIMATION_RINGS]>,
-}
-
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub struct RetargetedAnimationBlendRing2d {
-    pub first_stop_index: usize,
-    pub time: f32,
 }
 
 #[derive(Component, Reflect)]
@@ -141,7 +111,7 @@ pub fn retarget_animations(
                         retargeted_animations.insert(
                             (group_index, AnimationAssetId::Single(clip_id)),
                             RetargetedAnimation {
-                                nodes: RetargetedAnimationNodes::Single(clip_node_index),
+                                nodes: smallvec![clip_node_index],
                                 repeat: *repeat,
                             },
                         );
@@ -171,18 +141,13 @@ pub fn retarget_animations(
                                         1.0,
                                         blend_node_index,
                                     );
-                                    retargeted_stops.push(RetargetedAnimationBlendStop1d {
-                                        node,
-                                        time: input_stop.time,
-                                    });
+                                    retargeted_stops.push(node);
                                 }
 
                                 retargeted_animations.insert(
                                     (group_index, AnimationAssetId::Blend(blend_asset_id)),
                                     RetargetedAnimation {
-                                        nodes: RetargetedAnimationNodes::Blend1d(
-                                            RetargetedAnimationBlend1d(retargeted_stops),
-                                        ),
+                                        nodes: retargeted_stops,
                                         repeat: *repeat,
                                     },
                                 );
@@ -253,47 +218,26 @@ fn create_retargeted_animation_for_2d_blend(
 ) -> Option<RetargetedAnimation> {
     let blend_node_index = animation_graph.add_blend(1.0, animation_graph_blend_node);
 
-    let mut retargeted_rings = SmallVec::new();
-    let mut retargeted_stops = smallvec![RetargetedAnimationBlendStop1d {
-        node: animation_graph.add_clip(
-            animation_clip_assets.get_strong_handle(center)?,
-            1.0,
-            blend_node_index
-        ),
-        time: 0.0
-    }];
+    let mut retargeted_stops = smallvec![animation_graph.add_clip(
+        animation_clip_assets.get_strong_handle(center)?,
+        1.0,
+        blend_node_index
+    )];
     for input_ring in rings.iter() {
-        let first_stop_index = retargeted_stops.len();
         for input_stop in input_ring.stops.iter() {
             let node = animation_graph.add_clip(
                 animation_clip_assets.get_strong_handle(input_stop.clip.id())?,
                 1.0,
                 blend_node_index,
             );
-            retargeted_stops.push(RetargetedAnimationBlendStop1d {
-                node,
-                time: input_stop.time,
-            })
+            retargeted_stops.push(node);
         }
-        retargeted_rings.push(RetargetedAnimationBlendRing2d {
-            first_stop_index,
-            time: input_ring.time,
-        });
     }
 
     Some(RetargetedAnimation {
-        nodes: RetargetedAnimationNodes::Blend2d(RetargetedAnimationBlend2d {
-            stops: retargeted_stops,
-            rings: retargeted_rings,
-        }),
+        nodes: retargeted_stops,
         repeat: *repeat,
     })
-}
-
-impl InterpolationPoint1d for RetargetedAnimationBlendStop1d {
-    fn time(&self) -> f32 {
-        self.time
-    }
 }
 
 pub fn prepare_retargeting(

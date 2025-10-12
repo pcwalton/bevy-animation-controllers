@@ -2,20 +2,21 @@
 
 use bevy::{
     animation::AnimationPlayer,
+    asset::Assets,
     ecs::{
         component::{Component, Mutable},
         entity::Entity,
         hierarchy::Children,
-        system::{Query, StaticSystemParam, SystemParam},
+        system::{Query, Res, StaticSystemParam, SystemParam},
     },
     log::{debug, error, warn},
 };
 use std::{any, time::Duration};
 
 use crate::{
-    AnimationAction, AnimationBlend, AnimationBlendTime, AnimationController, AnimationGroup,
+    AnimationAction, AnimationBlend, AnimationBlendAsset, AnimationController, AnimationGroup,
     PlayingAnimation,
-    retargeting::{RetargetedAnimation, RetargetedAnimationNodes, RetargetedAnimations},
+    retargeting::{RetargetedAnimation, RetargetedAnimations},
 };
 
 pub trait AnimatedCharacter: Component {
@@ -49,6 +50,7 @@ pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>
         &mut AnimationPlayer,
         &RetargetedAnimations,
     )>,
+    animation_blend_assets: Res<Assets<AnimationBlendAsset>>,
     param: StaticSystemParam<A::SystemParam>,
 ) {
     for (entity, mut animated_character, children) in &mut q_characters {
@@ -103,39 +105,10 @@ pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>
                 group
             );
 
-            let playing_animation = match (new_animation_blend, nodes) {
-                (AnimationBlend::Single { .. }, RetargetedAnimationNodes::Single(node_index)) => {
-                    PlayingAnimation::Single(*node_index)
-                }
-                (
-                    AnimationBlend::Blend {
-                        blend: _,
-                        time: AnimationBlendTime::Blend1d(time),
-                    },
-                    RetargetedAnimationNodes::Blend1d(blend),
-                ) => PlayingAnimation::Blend1d {
-                    blend: (*blend).clone(),
-                    time,
-                },
-                (
-                    AnimationBlend::Blend {
-                        blend: _,
-                        time: AnimationBlendTime::Blend2d(time),
-                    },
-                    RetargetedAnimationNodes::Blend2d(blend),
-                ) => PlayingAnimation::Blend2d {
-                    blend: (*blend).clone(),
-                    time,
-                },
-                _ => {
-                    error!(
-                        "Mismatch between blend and retargeted animation nodes for {:?}, \
-                        group {:?}",
-                        any::type_name::<A>(),
-                        group
-                    );
-                    continue;
-                }
+            let playing_animation = PlayingAnimation {
+                blend: new_animation_blend,
+                // FIXME(pcwalton): We shouldn't clone this.
+                nodes: nodes.clone(),
             };
 
             animation_controller.group_mut(group).play(
@@ -144,6 +117,7 @@ pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>
                 animation_transition_time,
                 *repeat,
                 animation_action,
+                &animation_blend_assets,
             )
         }
 

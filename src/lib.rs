@@ -1,17 +1,11 @@
 //! Experimental animation controllers for Bevy.
 
-use crate::{
-    math::InterpolationResult,
-    retargeting::{
-        AnimationAssetId, AnimationsRetargetedEvent, RetargetedAnimationBlend1d,
-        RetargetedAnimationBlend2d, RetargetedAnimationBlendStop1d, RetargetedAnimationNodes,
-    },
-};
+use crate::retargeting::{AnimationAssetId, AnimationsRetargetedEvent};
 
 use bevy::{
     animation::{AnimationClip, AnimationPlayer, RepeatAnimation, graph::AnimationNodeIndex},
     app::{AnimationSystems, App, Plugin, PostUpdate, PreUpdate, Update},
-    asset::{Asset, AssetApp, AssetId, Handle},
+    asset::{Asset, AssetApp, AssetId, Assets, Handle},
     ecs::{component::Component, schedule::IntoScheduleConfigs as _, system::Res},
     log::{error, info, trace, warn},
     math::Vec2,
@@ -21,10 +15,9 @@ use bevy::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use smallvec::{SmallVec, smallvec};
-use std::{cmp::Ordering, f32::consts::PI, ops::Range, time::Duration};
+use std::{cmp::Ordering, f32::consts::PI, time::Duration};
 
 pub mod characters;
-pub mod math;
 pub mod retargeting;
 
 pub struct AnimationControllersPlugin;
@@ -52,17 +45,10 @@ pub struct AnimationGroupController {
     pub transitions: Vec<AnimationTransition>,
 }
 
-#[derive(Clone, PartialEq, Reflect, Debug)]
-pub enum PlayingAnimation {
-    Single(AnimationNodeIndex),
-    Blend1d {
-        blend: RetargetedAnimationBlend1d,
-        time: f32,
-    },
-    Blend2d {
-        blend: RetargetedAnimationBlend2d,
-        time: Vec2,
-    },
+#[derive(Clone, Reflect, Debug)]
+pub struct PlayingAnimation {
+    pub nodes: SmallVec<[AnimationNodeIndex; 1]>,
+    pub blend: AnimationBlend,
 }
 
 #[derive(Clone, Reflect, Debug)]
@@ -117,6 +103,7 @@ pub struct AnimationBlendAssetRing2d {
 #[reflect(Serialize, Deserialize)]
 pub struct AnimationBlendAssetClipHandle(pub Handle<AnimationClip>);
 
+#[derive(Clone, Reflect, Debug)]
 pub enum AnimationBlend {
     Single {
         clip: AssetId<AnimationClip>,
@@ -127,14 +114,10 @@ pub enum AnimationBlend {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Reflect, Debug)]
 pub enum AnimationBlendTime {
     Blend1d(f32),
     Blend2d(Vec2),
-}
-
-pub struct PlayingAnimationIterator<'a> {
-    animation: &'a PlayingAnimation,
-    index: usize,
 }
 
 #[derive(Debug)]
@@ -144,10 +127,14 @@ struct LinearInterpolationWeights {
     time: f32,
 }
 
+pub struct InterpolationResult {
+    pub prev_index: usize,
+    pub next_index: Option<usize>,
+    pub weight: f32,
+}
+
 /// The number of animation blends we store inline in a [`SmallVec`].
 const INLINE_ANIMATION_BLENDS: usize = 5;
-
-const INLINE_ANIMATION_RINGS: usize = 2;
 
 impl Plugin for AnimationControllersPlugin {
     fn build(&self, app: &mut App) {
@@ -192,6 +179,7 @@ impl AnimationGroupController {
         transition_duration: Duration,
         repeat: RepeatAnimation,
         action: AnimationAction,
+        animation_blend_assets: &Assets<AnimationBlendAsset>,
     ) {
         match action {
             AnimationAction::ChangeAndRestart => {
@@ -205,16 +193,24 @@ impl AnimationGroupController {
                 // Otherwise the transition ending would incorrectly stop the new animation.
                 // FIXME: O(n^2), is this bad?
                 self.transitions.retain(|transition| {
-                    new_animation.iter().all(|new_playing_animation_node| {
-                        *new_playing_animation_node != transition.animation
-                    })
+                    new_animation
+                        .nodes
+                        .iter()
+                        .all(|new_playing_animation_node| {
+                            *new_playing_animation_node != transition.animation
+                        })
                 });
 
-                self.start_playing_new_animation(player, new_animation, repeat);
+                self.start_playing_new_animation(
+                    player,
+                    new_animation,
+                    repeat,
+                    animation_blend_assets,
+                );
             }
 
             AnimationAction::ChangeTime => {
-                self.change_animation_time(player, new_animation, repeat)
+                self.change_animation_time(player, new_animation, repeat, animation_blend_assets)
             }
 
             AnimationAction::NoChange => {}
@@ -231,7 +227,7 @@ impl AnimationGroupController {
             return;
         };
 
-        for old_playing_animation_node in old_playing_animation.iter() {
+        for old_playing_animation_node in old_playing_animation.nodes.iter() {
             if transition_duration.is_zero() {
                 // Immediately stop the old animation.
                 trace!("Immediately stopping {:?}", *old_playing_animation_node);
@@ -272,18 +268,39 @@ impl AnimationGroupController {
         player: &mut AnimationPlayer,
         new_animation: PlayingAnimation,
         repeat: RepeatAnimation,
+        animation_blend_assets: &Assets<AnimationBlendAsset>,
     ) {
-        match new_animation {
-            PlayingAnimation::Single(node_index) => {
-                player.start(node_index).set_repeat(repeat);
+        match new_animation.blend {
+            AnimationBlend::Single { .. } => {
+                player.start(new_animation.nodes[0]).set_repeat(repeat);
             }
 
-            PlayingAnimation::Blend1d { blend, time } => {
+            AnimationBlend::Blend {
+                blend: blend_id,
+                time: AnimationBlendTime::Blend1d(time),
+            } => {
+                let Some(blend) = animation_blend_assets.get(blend_id) else {
+                    warn!(
+                        "Couldn't start playing new 1D blend {:?} because the blend asset didn't \
+                         exist",
+                        blend_id
+                    );
+                    return;
+                };
+                let AnimationBlendAssetType::Blend1d { ref stops } = blend.blend_type else {
+                    warn!(
+                        "Couldn't start playing new 1D blend {:?} because the blend asset wasn't a \
+                         1D blend",
+                        blend_id
+                    );
+                    return;
+                };
+
                 let InterpolationResult {
                     prev_index,
                     next_index,
                     weight,
-                } = math::linearly_interpolate_data(&blend, time);
+                } = linearly_interpolate_data(stops, time);
 
                 trace!(
                     "Interpolating between stop {:?} and {:?}: time {:?} prev time {:?} \
@@ -291,32 +308,53 @@ impl AnimationGroupController {
                     prev_index,
                     next_index,
                     time,
-                    blend[prev_index].time,
-                    next_index.map(|next_index| blend[next_index].time),
+                    stops[prev_index].time,
+                    next_index.map(|next_index| stops[next_index].time),
                     weight
                 );
 
                 player
-                    .start(blend[prev_index].node)
+                    .start(new_animation.nodes[prev_index])
                     .set_repeat(repeat)
                     .set_weight(1.0 - weight);
 
                 if let Some(next_index) = next_index {
                     player
-                        .start(blend[next_index].node)
+                        .start(new_animation.nodes[next_index])
                         .set_repeat(repeat)
                         .set_weight(weight);
                 }
             }
 
-            PlayingAnimation::Blend2d { blend, time } => {
-                let weights = polar_bilinear_interpolate(&blend, time);
+            AnimationBlend::Blend {
+                blend: blend_id,
+                time: AnimationBlendTime::Blend2d(time),
+            } => {
+                let Some(blend) = animation_blend_assets.get(blend_id) else {
+                    warn!(
+                        "Couldn't start playing new 2D blend {:?} because the blend asset didn't \
+                         exist",
+                        blend_id
+                    );
+                    return;
+                };
+                let AnimationBlendAssetType::Blend2d {
+                    ref rings,
+                    center: _,
+                } = blend.blend_type
+                else {
+                    warn!(
+                        "Couldn't start playing new 2D blend {:?} because the blend asset wasn't a \
+                         2D blend",
+                        blend_id
+                    );
+                    return;
+                };
 
-                for (stop, weight) in blend.stops.iter().zip(weights.iter()) {
-                    player
-                        .start(stop.node)
-                        .set_repeat(repeat)
-                        .set_weight(*weight);
+                let weights = polar_bilinear_interpolate(rings, &new_animation.nodes, time);
+
+                for (&node, weight) in new_animation.nodes.iter().zip(weights.iter()) {
+                    player.start(node).set_repeat(repeat).set_weight(*weight);
                 }
             }
         }
@@ -327,238 +365,226 @@ impl AnimationGroupController {
         player: &mut AnimationPlayer,
         new_animation: PlayingAnimation,
         repeat: RepeatAnimation,
+        animation_blend_assets: &Assets<AnimationBlendAsset>,
     ) {
         let Some(ref mut main_animation) = self.main_animation else {
             warn!("Attempted to change animation time, but no main animation was playing");
             return;
         };
 
-        match (new_animation, main_animation) {
-            (PlayingAnimation::Single(node_index), _) => {
+        match (new_animation.blend, &mut main_animation.blend) {
+            (AnimationBlend::Single { .. }, _) => {
                 error!(
                     "Attempted to change the time of a non-blend: {:?}",
-                    node_index
+                    new_animation.nodes[0]
                 );
             }
 
             (
-                PlayingAnimation::Blend1d { blend, time },
-                &mut PlayingAnimation::Blend1d {
-                    time: ref mut playing_time,
-                    blend: ref playing_blend,
+                AnimationBlend::Blend {
+                    blend: new_blend,
+                    time: AnimationBlendTime::Blend1d(new_time),
+                },
+                &mut AnimationBlend::Blend {
+                    blend: ref mut playing_blend,
+                    time: AnimationBlendTime::Blend1d(ref mut playing_time),
                 },
             ) => {
-                // FIXME: This should compare by pointer!
-                if blend != *playing_blend {
+                if new_blend != *playing_blend {
                     warn!("Attempted to change the time of a 1D blend that wasn't playing");
                     return;
                 }
 
-                *playing_time = time;
+                let Some(blend) = animation_blend_assets.get(new_blend) else {
+                    warn!(
+                        "Couldn't start playing new 1D blend {:?} because the blend asset didn't \
+                         exist",
+                        new_blend
+                    );
+                    return;
+                };
+                let AnimationBlendAssetType::Blend1d { ref stops } = blend.blend_type else {
+                    warn!(
+                        "Couldn't start playing new 1D blend {:?} because the blend asset wasn't a \
+                         1D blend",
+                        new_blend
+                    );
+                    return;
+                };
+
+                *playing_time = new_time;
 
                 let InterpolationResult {
                     prev_index,
                     next_index,
                     weight,
-                } = math::linearly_interpolate_data(&blend, time);
+                } = linearly_interpolate_data(stops, new_time);
 
                 trace!(
                     "Interpolating between stop {:?} and {:?}: time {:?} prev time {:?} \
                      next time {:?} next weight {:?}",
                     prev_index,
                     next_index,
-                    time,
-                    blend[prev_index].time,
-                    next_index.map(|next_index| blend[next_index].time),
+                    new_time,
+                    stops[prev_index].time,
+                    next_index.map(|next_index| stops[next_index].time),
                     weight
                 );
 
                 player
-                    .play(blend[prev_index].node)
+                    .play(new_animation.nodes[prev_index])
                     .set_repeat(repeat)
                     .set_weight(1.0 - weight);
 
                 if let Some(next_index) = next_index {
                     player
-                        .play(blend[next_index].node)
+                        .play(new_animation.nodes[next_index])
                         .set_repeat(repeat)
                         .set_weight(weight);
                 }
             }
 
-            (PlayingAnimation::Blend1d { .. }, _) => {
+            (
+                AnimationBlend::Blend {
+                    blend: _,
+                    time: AnimationBlendTime::Blend1d(_),
+                },
+                _,
+            ) => {
                 warn!("Attempted to change the time of a 1D blend, but a 1D blend wasn't playing");
             }
 
             (
-                PlayingAnimation::Blend2d { blend, time },
-                &mut PlayingAnimation::Blend2d {
-                    time: ref mut playing_time,
-                    blend: ref playing_blend,
+                AnimationBlend::Blend {
+                    blend: new_blend,
+                    time: AnimationBlendTime::Blend2d(new_time),
+                },
+                &mut AnimationBlend::Blend {
+                    blend: ref mut playing_blend,
+                    time: AnimationBlendTime::Blend2d(ref mut playing_time),
                 },
             ) => {
-                // FIXME: This should compare by pointer!
-                if blend != *playing_blend {
+                if new_blend != *playing_blend {
                     warn!("Attempted to change the time of a 2D blend that wasn't playing");
                     return;
                 }
 
-                *playing_time = time;
+                let Some(blend) = animation_blend_assets.get(new_blend) else {
+                    warn!(
+                        "Couldn't start playing new 2D blend {:?} because the blend asset didn't \
+                         exist",
+                        new_blend
+                    );
+                    return;
+                };
+                let AnimationBlendAssetType::Blend2d {
+                    ref rings,
+                    center: _,
+                } = blend.blend_type
+                else {
+                    warn!(
+                        "Couldn't start playing new 2D blend {:?} because the blend asset wasn't a \
+                         2D blend",
+                        new_blend
+                    );
+                    return;
+                };
 
-                let weights = polar_bilinear_interpolate(&blend, time);
+                *playing_time = new_time;
 
-                for (stop, weight) in blend.stops.iter().zip(weights.iter()) {
-                    player
-                        .play(stop.node)
-                        .set_repeat(repeat)
-                        .set_weight(*weight);
+                let weights = polar_bilinear_interpolate(rings, &new_animation.nodes, new_time);
+
+                for (node, weight) in new_animation.nodes.iter().zip(weights.iter()) {
+                    player.play(*node).set_repeat(repeat).set_weight(*weight);
                 }
             }
 
-            (PlayingAnimation::Blend2d { .. }, _) => {
+            (
+                AnimationBlend::Blend {
+                    blend: _,
+                    time: AnimationBlendTime::Blend2d(_),
+                },
+                _,
+            ) => {
                 warn!("Attempted to change the time of a 2D blend, but a 2D blend wasn't playing");
             }
         }
     }
 }
 
-impl PlayingAnimation {
-    fn iter(&self) -> PlayingAnimationIterator {
-        PlayingAnimationIterator {
-            animation: self,
-            index: 0,
-        }
-    }
-}
-
-impl<'a> Iterator for PlayingAnimationIterator<'a> {
-    type Item = &'a AnimationNodeIndex;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match (self.animation, self.index) {
-            (PlayingAnimation::Single(node_index), 0) => {
-                self.index += 1;
-                Some(node_index)
-            }
-            (PlayingAnimation::Single(_), _) => None,
-            (PlayingAnimation::Blend1d { blend, time: _ }, index) if index < blend.len() => {
-                let stop = &blend[self.index];
-                self.index += 1;
-                Some(&stop.node)
-            }
-            (PlayingAnimation::Blend1d { .. }, _) => None,
-            (PlayingAnimation::Blend2d { blend, time: _ }, index) if index < blend.stops.len() => {
-                let stop = &blend.stops[self.index];
-                self.index += 1;
-                Some(&stop.node)
-            }
-            (PlayingAnimation::Blend2d { .. }, _) => None,
-        }
-    }
-}
-
-impl PlayingAnimation {
-    /// This is only useful when you know the animation isn't a blend, because
-    /// it doesn't supply a blend weight.
-    pub fn from_retargeted_animation(
-        retargeted_animation: &RetargetedAnimationNodes,
-    ) -> PlayingAnimation {
-        match retargeted_animation {
-            RetargetedAnimationNodes::Single(node_index) => PlayingAnimation::Single(*node_index),
-
-            RetargetedAnimationNodes::Blend1d(blend) => {
-                warn!(
-                    "`PlayingAnimation::from_retargeted_animation` called on a 1D blendtree; \
-                     assuming time is zero"
-                );
-                PlayingAnimation::Blend1d {
-                    blend: (*blend).clone(),
-                    time: 0.0,
-                }
-            }
-
-            RetargetedAnimationNodes::Blend2d(blend) => {
-                warn!(
-                    "`PlayingAnimation::from_retargeted_animation` called on a 2D blendtree; \
-                    assuming time is (0.0, 0.0)"
-                );
-                PlayingAnimation::Blend2d {
-                    blend: (*blend).clone(),
-                    time: Vec2::ZERO,
-                }
-            }
-        }
-    }
-}
-
 pub fn polar_bilinear_interpolate(
-    blend: &RetargetedAnimationBlend2d,
+    rings: &[AnimationBlendAssetRing2d],
+    nodes: &[AnimationNodeIndex],
     time: Vec2,
 ) -> SmallVec<[f32; INLINE_ANIMATION_BLENDS]> {
-    let next_ring_index = match blend
-        .rings
-        .binary_search_by(|ring| ring.time.partial_cmp(&time.x).unwrap_or(Ordering::Less))
-    {
-        Ok(next_ring_index) => next_ring_index,
-        Err(next_ring_index) => next_ring_index,
-    };
+    // FIXME(pcwalton): This could be a fixed array of length 2.
+    let mut first_stop_in_each_ring = Vec::with_capacity(rings.len() + 1);
+    first_stop_in_each_ring.push(1);
+    for ring in rings {
+        let first_stop_in_this_ring = *first_stop_in_each_ring.last().unwrap() + ring.stops.len();
+        first_stop_in_each_ring.push(first_stop_in_this_ring);
+    }
 
-    let next_weights = if next_ring_index == blend.rings.len() - 1 {
-        Some(linear_interpolate_ring(
-            &blend.stops,
-            (blend.rings[next_ring_index].first_stop_index)..(blend.stops.len()),
-            time.y,
-        ))
-    } else if next_ring_index < blend.rings.len() - 1 {
-        Some(linear_interpolate_ring(
-            &blend.stops,
-            (blend.rings[next_ring_index].first_stop_index)
-                ..(blend.rings[next_ring_index + 1].first_stop_index),
-            time.y,
+    let mut next_ring_index = None;
+    for (ring_index, ring) in rings.iter().enumerate() {
+        if time.x < ring.time {
+            next_ring_index = Some(ring_index);
+            break;
+        }
+    }
+    let next_ring_index = next_ring_index.unwrap_or(rings.len());
+
+    let next_weights = rings.get(next_ring_index).map(|ring| {
+        (
+            linear_interpolate_ring(ring, time.y),
+            first_stop_in_each_ring[next_ring_index],
+        )
+    });
+
+    let prev_weights = if next_ring_index > 0 {
+        Some((
+            linear_interpolate_ring(&rings[next_ring_index - 1], time.y),
+            first_stop_in_each_ring[next_ring_index - 1],
         ))
     } else {
         None
     };
 
-    let prev_weights = if next_ring_index > 0 && next_ring_index == blend.rings.len() {
-        Some(linear_interpolate_ring(
-            &blend.stops,
-            (blend.rings[next_ring_index - 1].first_stop_index)..(blend.stops.len()),
-            time.y,
-        ))
-    } else if next_ring_index > 0 {
-        Some(linear_interpolate_ring(
-            &blend.stops,
-            (blend.rings[next_ring_index - 1].first_stop_index)
-                ..(blend.rings[next_ring_index].first_stop_index),
-            time.y,
-        ))
-    } else {
-        None
-    };
-
-    let mut weights = smallvec![0.0; blend.stops.len()];
+    let mut weights = smallvec![0.0; nodes.len()];
 
     match (prev_weights, next_weights) {
         (None, None) => weights[0] = 1.0,
-        (Some(prev_weights), None) => {
-            weights[prev_weights.prev_stop_index] = 1.0 - prev_weights.time;
-            weights[prev_weights.next_stop_index] = prev_weights.time;
+        (Some((prev_weights, first_stop_in_prev_ring)), None) => {
+            weights[first_stop_in_prev_ring + prev_weights.prev_stop_index] =
+                1.0 - prev_weights.time;
+            weights[first_stop_in_prev_ring + prev_weights.next_stop_index] = prev_weights.time;
         }
-        (None, Some(next_weights)) => {
-            let radius_time = time.x / blend.rings[0].time;
+        (None, Some((next_weights, first_stop_in_next_ring))) => {
+            let radius_time = time.x / rings[0].time;
             weights[0] = radius_time;
-            weights[next_weights.prev_stop_index] = (1.0 - radius_time) * (1.0 - next_weights.time);
-            weights[next_weights.next_stop_index] = (1.0 - radius_time) * next_weights.time;
+            weights[first_stop_in_next_ring + next_weights.prev_stop_index] =
+                (1.0 - radius_time) * (1.0 - next_weights.time);
+            weights[first_stop_in_next_ring + next_weights.next_stop_index] =
+                (1.0 - radius_time) * next_weights.time;
         }
-        (Some(prev_weights), Some(next_weights)) => {
+        (
+            Some((prev_weights, first_stop_in_prev_ring)),
+            Some((next_weights, first_stop_in_next_ring)),
+        ) => {
             let prev_ring_index = next_ring_index - 1;
-            let radius_time = (time.x - blend.rings[prev_ring_index].time)
-                / (blend.rings[next_ring_index].time - blend.rings[prev_ring_index].time);
-            weights[prev_weights.prev_stop_index] = radius_time * (1.0 - prev_weights.time);
-            weights[prev_weights.next_stop_index] = radius_time * prev_weights.time;
-            weights[next_weights.prev_stop_index] = (1.0 - radius_time) * (1.0 - next_weights.time);
-            weights[next_weights.next_stop_index] = (1.0 - radius_time) * next_weights.time;
+            let radius_time = linstep(
+                rings[prev_ring_index].time,
+                rings[next_ring_index].time,
+                time.x,
+            );
+            weights[first_stop_in_prev_ring + prev_weights.prev_stop_index] =
+                radius_time * (1.0 - prev_weights.time);
+            weights[first_stop_in_prev_ring + prev_weights.next_stop_index] =
+                radius_time * prev_weights.time;
+            weights[first_stop_in_next_ring + next_weights.prev_stop_index] =
+                (1.0 - radius_time) * (1.0 - next_weights.time);
+            weights[first_stop_in_next_ring + next_weights.next_stop_index] =
+                (1.0 - radius_time) * next_weights.time;
         }
     }
 
@@ -566,45 +592,44 @@ pub fn polar_bilinear_interpolate(
 }
 
 fn linear_interpolate_ring(
-    stops: &[RetargetedAnimationBlendStop1d],
-    stop_range: Range<usize>,
+    ring: &AnimationBlendAssetRing2d,
     time: f32,
 ) -> LinearInterpolationWeights {
-    debug_assert!(!stops.is_empty());
+    debug_assert!(!ring.stops.is_empty());
 
-    if stop_range.len() == 1 {
+    if ring.stops.len() == 1 {
         return LinearInterpolationWeights {
-            prev_stop_index: stop_range.start,
-            next_stop_index: stop_range.end,
+            prev_stop_index: 0,
+            next_stop_index: 1,
             time: 0.0,
         };
     }
 
     let time = time.rem_euclid(2.0 * PI);
 
-    let mut next_stop_index = stop_range.start
-        + match stops[stop_range.clone()]
-            .binary_search_by(|stop| stop.time.partial_cmp(&time).unwrap_or(Ordering::Less))
-        {
-            Ok(next_stop_index) => next_stop_index,
-            Err(next_stop_index) => next_stop_index,
-        };
-    if next_stop_index == stop_range.end {
-        next_stop_index = stop_range.start;
+    let mut next_stop_index = match ring
+        .stops
+        .binary_search_by(|stop| stop.time.partial_cmp(&time).unwrap_or(Ordering::Less))
+    {
+        Ok(next_stop_index) => next_stop_index,
+        Err(next_stop_index) => next_stop_index,
+    };
+    if next_stop_index == ring.stops.len() {
+        next_stop_index = 0;
     }
-    let prev_stop_index = if next_stop_index == stop_range.start {
-        stop_range.end - 1
+    let prev_stop_index = if next_stop_index == 0 {
+        ring.stops.len() - 1
     } else {
         next_stop_index - 1
     };
 
-    let prev_time = stops[prev_stop_index].time;
-    let mut next_time = stops[next_stop_index].time;
+    let prev_time = ring.stops[prev_stop_index].time;
+    let mut next_time = ring.stops[next_stop_index].time;
     if next_time < prev_time {
         next_time += 2.0 * PI;
     }
 
-    let time = (time - prev_time) / (next_time - prev_time);
+    let time = linstep(prev_time, next_time, time);
 
     LinearInterpolationWeights {
         prev_stop_index,
@@ -617,6 +642,7 @@ fn linear_interpolate_ring(
 /// the current time and decline amount.
 pub fn advance_transitions(
     mut q_animations: Query<(&mut AnimationController, &mut AnimationPlayer)>,
+    animation_blend_assets: Res<Assets<AnimationBlendAsset>>,
     time: Res<Time>,
 ) {
     // We use a "greedy layer" system here. The top layer (most recent
@@ -649,7 +675,12 @@ pub fn advance_transitions(
             //
             // FIXME: This evaluates animations twice! Such a botch!
             if let Some(main_animation) = &animation_group_controller.main_animation {
-                distribute_weight(&mut player, main_animation, remaining_weight);
+                distribute_weight(
+                    &mut player,
+                    main_animation,
+                    remaining_weight,
+                    &animation_blend_assets,
+                );
             }
         }
     }
@@ -659,22 +690,43 @@ fn distribute_weight(
     player: &mut AnimationPlayer,
     main_animation: &PlayingAnimation,
     remaining_weight: f32,
+    animation_blend_assets: &Assets<AnimationBlendAsset>,
 ) {
-    match main_animation {
-        PlayingAnimation::Single(node_index) => {
-            if let Some(ref mut animation) = player.animation_mut(*node_index) {
+    match main_animation.blend {
+        AnimationBlend::Single { .. } => {
+            if let Some(ref mut animation) = player.animation_mut(main_animation.nodes[0]) {
                 animation.set_weight(remaining_weight);
             }
         }
 
-        PlayingAnimation::Blend1d { blend, time } => {
+        AnimationBlend::Blend {
+            blend: blend_id,
+            time: AnimationBlendTime::Blend1d(time),
+        } => {
+            let Some(blend) = animation_blend_assets.get(blend_id) else {
+                warn!(
+                    "Couldn't distribute weight for 1D blend {:?} because the blend asset didn't \
+                         exist",
+                    blend_id
+                );
+                return;
+            };
+            let AnimationBlendAssetType::Blend1d { ref stops } = blend.blend_type else {
+                warn!(
+                    "Couldn't distribute weight for 1D blend {:?} because the blend asset wasn't a \
+                         1D blend",
+                    blend_id
+                );
+                return;
+            };
+
             // Evaluate blend and distribute remaining weight.
 
             let InterpolationResult {
                 prev_index,
                 next_index,
                 weight: interpolated_weight,
-            } = math::linearly_interpolate_data(blend, *time);
+            } = linearly_interpolate_data(stops, time);
 
             trace!(
                 "Distributing weight: Interpolating between stop {:?} and {:?}: time {:?} prev \
@@ -682,13 +734,13 @@ fn distribute_weight(
                 prev_index,
                 next_index,
                 time,
-                blend[prev_index].time,
-                next_index.map(|next_index| blend[next_index].time),
+                stops[prev_index].time,
+                next_index.map(|next_index| stops[next_index].time),
                 interpolated_weight
             );
 
-            for (blend_stop_index, blend_stop) in blend.0.iter().enumerate() {
-                let Some(ref mut animation) = player.animation_mut(blend_stop.node) else {
+            for (blend_stop_index, node) in main_animation.nodes.iter().enumerate() {
+                let Some(ref mut animation) = player.animation_mut(*node) else {
                     continue;
                 };
                 let weight = if blend_stop_index == prev_index {
@@ -702,11 +754,35 @@ fn distribute_weight(
             }
         }
 
-        PlayingAnimation::Blend2d { blend, time } => {
-            let weights = polar_bilinear_interpolate(blend, *time);
+        AnimationBlend::Blend {
+            blend: blend_id,
+            time: AnimationBlendTime::Blend2d(time),
+        } => {
+            let Some(blend) = animation_blend_assets.get(blend_id) else {
+                warn!(
+                    "Couldn't distribute weight for 2D blend {:?} because the blend asset didn't \
+                         exist",
+                    blend_id
+                );
+                return;
+            };
+            let AnimationBlendAssetType::Blend2d {
+                ref rings,
+                center: _,
+            } = blend.blend_type
+            else {
+                warn!(
+                    "Couldn't distribute weight for 2D blend {:?} because the blend asset wasn't a \
+                     2D blend",
+                    blend_id
+                );
+                return;
+            };
 
-            for (stop, interpolated_weight) in blend.stops.iter().zip(weights.iter()) {
-                if let Some(ref mut animation) = player.animation_mut(stop.node) {
+            let weights = polar_bilinear_interpolate(rings, &main_animation.nodes, time);
+
+            for (node, interpolated_weight) in main_animation.nodes.iter().zip(weights.iter()) {
+                if let Some(ref mut animation) = player.animation_mut(*node) {
                     animation.set_weight(remaining_weight * *interpolated_weight);
                 }
             }
@@ -802,4 +878,54 @@ impl From<AssetId<AnimationClip>> for AnimationBlend {
     fn from(clip: AssetId<AnimationClip>) -> Self {
         AnimationBlend::Single { clip }
     }
+}
+
+fn linearly_interpolate_data(
+    stops: &[AnimationBlendAssetStop1d],
+    time: f32,
+) -> InterpolationResult {
+    debug_assert!(!stops.is_empty());
+
+    let mut next_point_index = None;
+    for (point_index, point) in stops.iter().enumerate() {
+        if time < point.time {
+            next_point_index = Some(point_index);
+            break;
+        }
+    }
+
+    match next_point_index {
+        Some(0) => {
+            // Before first point.
+            InterpolationResult {
+                prev_index: 0,
+                next_index: None,
+                weight: 0.0,
+            }
+        }
+        None => {
+            // After last point.
+            InterpolationResult {
+                prev_index: stops.len() - 1,
+                next_index: None,
+                weight: 0.0,
+            }
+        }
+        Some(next_index) => {
+            // In between two stops.
+            let prev_index = next_index - 1;
+            let prev_time = stops[prev_index].time;
+            let next_time = stops[next_index].time;
+            let weight = linstep(prev_time, next_time, time);
+            InterpolationResult {
+                prev_index: next_index - 1,
+                next_index: Some(next_index),
+                weight,
+            }
+        }
+    }
+}
+
+pub fn linstep(edge_0: f32, edge_1: f32, x: f32) -> f32 {
+    (x - edge_0) / (edge_1 - edge_0)
 }
