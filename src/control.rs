@@ -10,16 +10,17 @@ use bevy::{
         system::{Query, Res, StaticSystemParam, SystemParam},
     },
     log::{debug, error, warn},
+    reflect::Reflect,
 };
 use std::{any, time::Duration};
 
 use crate::{
-    AnimationAction, AnimationBlend, AnimationBlendAsset, AnimationController, AnimationGroup,
-    PlayingAnimation,
+    AnimationBlend, AnimationBlendAsset, AnimationLayer,
+    playback::{PlayingAnimation, PlayingAnimations},
     retargeting::{RetargetedAnimation, RetargetedAnimations},
 };
 
-pub trait AnimatedCharacter: Component {
+pub trait AnimationControl: Component {
     type AnimationState;
     type SystemParam: SystemParam;
 
@@ -32,21 +33,32 @@ pub trait AnimatedCharacter: Component {
     ) -> Self::AnimationState;
     fn compute_animation_action(
         &self,
-        group: AnimationGroup,
+        group: AnimationLayer,
         new_state: &Self::AnimationState,
-    ) -> AnimationAction;
+    ) -> AnimationTransitionMode;
     fn animation_for_state(
-        group: AnimationGroup,
+        group: AnimationLayer,
         state: &Self::AnimationState,
         param: &StaticSystemParam<'_, '_, Self::SystemParam>,
     ) -> (Option<AnimationBlend>, Duration);
     fn set_current_animation_state(&mut self, new_state: &Self::AnimationState);
 }
 
-pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>(
+/// How a character animation transition should occur.
+#[derive(Clone, Copy, PartialEq, Reflect, Debug)]
+pub enum AnimationTransitionMode {
+    /// Keep the animation playing as is.
+    NoChange,
+    /// Change the time of the current 1D or 2D blend animation.
+    ChangeTime,
+    /// Change the animation, and restart it.
+    ChangeAndRestart,
+}
+
+pub fn update_animation_controllers<A: AnimationControl + Component<Mutability = Mutable>>(
     mut q_characters: Query<(Entity, &mut A, &Children)>,
     mut q_rigs: Query<(
-        &mut AnimationController,
+        &mut PlayingAnimations,
         &mut AnimationPlayer,
         &RetargetedAnimations,
     )>,
@@ -74,10 +86,10 @@ pub fn animate_character<A: AnimatedCharacter + Component<Mutability = Mutable>>
         let new_animation_state = animated_character.compute_new_animation_state(entity, &param);
         let mut any_dirty = false;
         for group in 0..A::GROUP_COUNT {
-            let group = AnimationGroup(group);
+            let group = AnimationLayer(group);
             let animation_action =
                 animated_character.compute_animation_action(group, &new_animation_state);
-            if animation_action == AnimationAction::NoChange {
+            if animation_action == AnimationTransitionMode::NoChange {
                 continue;
             }
             any_dirty = true;

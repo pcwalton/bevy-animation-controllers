@@ -27,7 +27,7 @@ use smallvec::{SmallVec, smallvec};
 use std::iter;
 
 use crate::{
-    AnimationBlendAsset, AnimationBlendAssetRing2d, AnimationBlendAssetType, AnimationGroup,
+    AnimationBlendAsset, AnimationBlendAssetRing2d, AnimationBlendAssetType, AnimationLayer,
 };
 
 /// Fired when all animations for an entity have been retargeted.
@@ -46,7 +46,7 @@ pub enum AnimationAssetId {
 }
 
 #[derive(Clone, Component, Default, Deref, DerefMut)]
-pub struct RetargetedAnimations(HashMap<(AnimationGroup, AnimationAssetId), RetargetedAnimation>);
+pub struct RetargetedAnimations(HashMap<(AnimationLayer, AnimationAssetId), RetargetedAnimation>);
 
 #[derive(Clone, Reflect)]
 pub struct RetargetedAnimation {
@@ -91,7 +91,7 @@ pub fn retarget_animations(
         &mut q_retargeting_targets
     {
         for (group_index, group) in animation_retargeter.groups.iter_mut().enumerate() {
-            let group_index = AnimationGroup(group_index as u32);
+            let group_index = AnimationLayer(group_index as u32);
             group.animations.retain(|(clip, repeat)| {
                 let animation_graph = animation_graph_assets
                     .get_mut(animation_graph.id())
