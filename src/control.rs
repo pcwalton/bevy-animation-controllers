@@ -24,7 +24,7 @@ pub trait AnimationControl: Component {
     type AnimationState;
     type SystemParam: SystemParam;
 
-    const GROUP_COUNT: u32;
+    const LAYER_COUNT: u32;
 
     fn compute_new_animation_state(
         &self,
@@ -85,27 +85,27 @@ pub fn update_animation_controllers<A: AnimationControl + Component<Mutability =
 
         let new_animation_state = animated_character.compute_new_animation_state(entity, &param);
         let mut any_dirty = false;
-        for group in 0..A::GROUP_COUNT {
-            let group = AnimationLayer(group);
+        for layer in 0..A::LAYER_COUNT {
+            let layer = AnimationLayer(layer);
             let animation_action =
-                animated_character.compute_animation_action(group, &new_animation_state);
+                animated_character.compute_animation_action(layer, &new_animation_state);
             if animation_action == AnimationTransitionMode::NoChange {
                 continue;
             }
             any_dirty = true;
 
             let (Some(new_animation_blend), animation_transition_time) =
-                A::animation_for_state(group, &new_animation_state, &param)
+                A::animation_for_state(layer, &new_animation_state, &param)
             else {
                 continue;
             };
             let Some(RetargetedAnimation { nodes, repeat }) =
-                retargeted_animations.get(&(group, new_animation_blend.asset_id()))
+                retargeted_animations.get(&(layer, new_animation_blend.asset_id()))
             else {
                 warn!(
                     "Couldn't find animation for {:?}, group {:?}, tag {:?}",
                     any::type_name::<A>(),
-                    group,
+                    layer,
                     new_animation_blend.asset_id()
                 );
                 continue;
@@ -114,7 +114,7 @@ pub fn update_animation_controllers<A: AnimationControl + Component<Mutability =
             debug!(
                 "Changing animation for {:?}, group {:?}",
                 any::type_name::<A>(),
-                group
+                layer
             );
 
             let playing_animation = PlayingAnimation {
@@ -123,7 +123,7 @@ pub fn update_animation_controllers<A: AnimationControl + Component<Mutability =
                 nodes: nodes.clone(),
             };
 
-            animation_controller.group_mut(group).play(
+            animation_controller.group_mut(layer).play(
                 &mut animation_player,
                 playing_animation,
                 animation_transition_time,

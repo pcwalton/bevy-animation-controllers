@@ -47,9 +47,9 @@ pub struct TransitioningAnimation {
 }
 
 impl PlayingAnimations {
-    pub fn new(group_count: u32) -> PlayingAnimations {
+    pub fn new(layer_count: u32) -> PlayingAnimations {
         PlayingAnimations {
-            layers: (0..group_count)
+            layers: (0..layer_count)
                 .map(|_| LayerAnimations::default())
                 .collect(),
         }
