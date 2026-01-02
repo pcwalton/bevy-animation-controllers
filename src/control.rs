@@ -15,7 +15,7 @@ use bevy::{
 use std::{any, time::Duration};
 
 use crate::{
-    AnimationBlend, AnimationBlendAsset, AnimationLayer,
+    AnimationBlendAsset, AnimationLayer, LabeledAnimationBlend,
     playback::{PlayingAnimation, PlayingAnimations},
     retargeting::{RetargetedAnimation, RetargetedAnimations},
 };
@@ -40,7 +40,7 @@ pub trait AnimationControl: Component {
         group: AnimationLayer,
         state: &Self::AnimationState,
         param: &StaticSystemParam<'_, '_, Self::SystemParam>,
-    ) -> (Option<AnimationBlend>, Duration);
+    ) -> (Option<LabeledAnimationBlend>, Duration);
     fn set_current_animation_state(&mut self, new_state: &Self::AnimationState);
 }
 

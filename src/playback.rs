@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::{
     AnimationBlend, AnimationBlendAsset, AnimationBlendAssetType, AnimationBlendTime,
-    AnimationLayer,
+    AnimationLayer, LabeledAnimationBlend,
     control::AnimationTransitionMode,
     interpolation::{self, InterpolationResult},
 };
@@ -27,8 +27,9 @@ pub struct PlayingAnimations {
     pub layers: Vec<LayerAnimations>,
 }
 
-#[derive(Clone, Default, Reflect, Debug)]
+#[derive(Clone, Reflect, Debug)]
 pub struct LayerAnimations {
+    pub layer_index: AnimationLayer,
     pub main_animation: Option<PlayingAnimation>,
     pub transitions: Vec<TransitioningAnimation>,
 }
@@ -36,7 +37,7 @@ pub struct LayerAnimations {
 #[derive(Clone, Reflect, Debug)]
 pub struct PlayingAnimation {
     pub nodes: SmallVec<[AnimationNodeIndex; 1]>,
-    pub blend: AnimationBlend,
+    pub blend: LabeledAnimationBlend,
 }
 
 #[derive(Clone, Reflect, Debug)]
@@ -50,7 +51,7 @@ impl PlayingAnimations {
     pub fn new(layer_count: u32) -> PlayingAnimations {
         PlayingAnimations {
             layers: (0..layer_count)
-                .map(|_| LayerAnimations::default())
+                .map(|layer_index| LayerAnimations::new(AnimationLayer(layer_index)))
                 .collect(),
         }
     }
@@ -61,6 +62,14 @@ impl PlayingAnimations {
 }
 
 impl LayerAnimations {
+    fn new(layer_index: AnimationLayer) -> LayerAnimations {
+        LayerAnimations {
+            layer_index,
+            main_animation: None,
+            transitions: vec![],
+        }
+    }
+
     /// Plays a new animation on the given [`AnimationPlayer`], fading out any
     /// existing animations that were already playing over the
     /// `transition_duration`.
@@ -165,7 +174,7 @@ impl LayerAnimations {
         repeat: RepeatAnimation,
         animation_blend_assets: &Assets<AnimationBlendAsset>,
     ) {
-        match new_animation.blend {
+        match new_animation.blend.blend {
             AnimationBlend::Single { .. } => {
                 player.start(new_animation.nodes[0]).set_repeat(repeat);
             }
@@ -268,42 +277,49 @@ impl LayerAnimations {
             return;
         };
 
-        match (new_animation.blend, &mut main_animation.blend) {
-            (AnimationBlend::Single { .. }, _) => {
+        match (&new_animation.blend.blend, &mut main_animation.blend) {
+            (&AnimationBlend::Single { .. }, _) => {
                 error!(
-                    "Attempted to change the time of a non-blend: {:?}",
-                    new_animation.nodes[0]
+                    "Attempted to change the time of a non-blend \"{}\" for layer {:?}: {:?}",
+                    new_animation.blend.label, self.layer_index, new_animation.nodes[0]
                 );
             }
 
             (
-                AnimationBlend::Blend {
+                &AnimationBlend::Blend {
                     blend: new_blend,
                     time: AnimationBlendTime::Blend1d(new_time),
                 },
-                &mut AnimationBlend::Blend {
-                    blend: ref mut playing_blend,
-                    time: AnimationBlendTime::Blend1d(ref mut playing_time),
+                &mut LabeledAnimationBlend {
+                    ref label,
+                    blend:
+                        AnimationBlend::Blend {
+                            blend: ref mut playing_blend,
+                            time: AnimationBlendTime::Blend1d(ref mut playing_time),
+                        },
                 },
             ) => {
                 if new_blend != *playing_blend {
-                    warn!("Attempted to change the time of a 1D blend that wasn't playing");
+                    warn!(
+                        "Attempted to change the time of a 1D blend \"{}\" that wasn't playing",
+                        label
+                    );
                     return;
                 }
 
                 let Some(blend) = animation_blend_assets.get(new_blend) else {
                     warn!(
-                        "Couldn't start playing new 1D blend {:?} because the blend asset didn't \
+                        "Couldn't start playing new 1D blend \"{}\" because the blend asset didn't \
                          exist",
-                        new_blend
+                        label,
                     );
                     return;
                 };
                 let AnimationBlendAssetType::Blend1d { ref stops } = blend.blend_type else {
                     warn!(
-                        "Couldn't start playing new 1D blend {:?} because the blend asset wasn't a \
+                        "Couldn't start playing new 1D blend \"{}\" because the blend asset wasn't a \
                          1D blend",
-                        new_blend
+                        label,
                     );
                     return;
                 };
@@ -341,7 +357,7 @@ impl LayerAnimations {
             }
 
             (
-                AnimationBlend::Blend {
+                &AnimationBlend::Blend {
                     blend: _,
                     time: AnimationBlendTime::Blend1d(_),
                 },
@@ -351,13 +367,17 @@ impl LayerAnimations {
             }
 
             (
-                AnimationBlend::Blend {
+                &AnimationBlend::Blend {
                     blend: new_blend,
                     time: AnimationBlendTime::Blend2d(new_time),
                 },
-                &mut AnimationBlend::Blend {
-                    blend: ref mut playing_blend,
-                    time: AnimationBlendTime::Blend2d(ref mut playing_time),
+                &mut LabeledAnimationBlend {
+                    blend:
+                        AnimationBlend::Blend {
+                            blend: ref mut playing_blend,
+                            time: AnimationBlendTime::Blend2d(ref mut playing_time),
+                        },
+                    ref label,
                 },
             ) => {
                 if new_blend != *playing_blend {
@@ -369,7 +389,7 @@ impl LayerAnimations {
                     warn!(
                         "Couldn't start playing new 2D blend {:?} because the blend asset didn't \
                          exist",
-                        new_blend
+                        label,
                     );
                     return;
                 };
@@ -400,7 +420,7 @@ impl LayerAnimations {
             }
 
             (
-                AnimationBlend::Blend {
+                &AnimationBlend::Blend {
                     blend: _,
                     time: AnimationBlendTime::Blend2d(_),
                 },
@@ -466,7 +486,7 @@ fn distribute_weight(
     remaining_weight: f32,
     animation_blend_assets: &Assets<AnimationBlendAsset>,
 ) {
-    match main_animation.blend {
+    match main_animation.blend.blend {
         AnimationBlend::Single { .. } => {
             if let Some(ref mut animation) = player.animation_mut(main_animation.nodes[0]) {
                 animation.set_weight(remaining_weight);

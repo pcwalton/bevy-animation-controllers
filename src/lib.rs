@@ -1,5 +1,7 @@
 //! Experimental animation controllers for Bevy.
 
+use std::borrow::Cow;
+
 use crate::retargeting::{AnimationAssetId, AnimationsRetargetedEvent};
 
 use bevy::{
@@ -64,6 +66,13 @@ pub struct AnimationBlendAssetRing2d {
 #[derive(Clone, Reflect, Debug, Deref, DerefMut)]
 #[reflect(Serialize, Deserialize)]
 pub struct AnimationBlendAssetClipHandle(pub Handle<AnimationClip>);
+
+#[derive(Clone, Reflect, Debug, Deref, DerefMut)]
+pub struct LabeledAnimationBlend {
+    #[deref]
+    pub blend: AnimationBlend,
+    pub label: Cow<'static, str>,
+}
 
 #[derive(Clone, Reflect, Debug)]
 pub enum AnimationBlend {
@@ -176,5 +185,23 @@ impl From<Vec2> for AnimationBlendTime {
 impl From<AssetId<AnimationClip>> for AnimationBlend {
     fn from(clip: AssetId<AnimationClip>) -> Self {
         AnimationBlend::Single { clip }
+    }
+}
+
+impl From<AnimationBlend> for LabeledAnimationBlend {
+    fn from(blend: AnimationBlend) -> Self {
+        LabeledAnimationBlend {
+            label: match blend {
+                AnimationBlend::Single { .. } => Cow::Borrowed("(single animation)"),
+                AnimationBlend::Blend { .. } => Cow::Borrowed("(animation blend)"),
+            },
+            blend,
+        }
+    }
+}
+
+impl From<AssetId<AnimationClip>> for LabeledAnimationBlend {
+    fn from(clip: AssetId<AnimationClip>) -> Self {
+        LabeledAnimationBlend::from(AnimationBlend::from(clip))
     }
 }
