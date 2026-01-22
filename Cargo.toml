@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 arrayvec = "0.7"
-bevy = "0.17"
+bevy = "0.18"
 serde = "1"
 smallvec = "1"
 toml = "0.9"

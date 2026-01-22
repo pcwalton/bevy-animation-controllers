@@ -3,7 +3,7 @@
 use arrayvec::ArrayVec;
 use bevy::{
     animation::{
-        AnimationClip, AnimationPlayer, AnimationTarget, AnimationTargetId, RepeatAnimation,
+        AnimatedBy, AnimationClip, AnimationPlayer, AnimationTargetId, RepeatAnimation,
         graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
     },
     asset::{AssetId, AssetServer, Assets, Handle},
@@ -337,10 +337,9 @@ pub fn prepare_retargeting(
 
         debug!("Adding animation target for {}: {:?}", debug_name, path);
 
-        commands.entity(entity).insert(AnimationTarget {
-            id: AnimationTargetId::from_names(path.iter()),
-            player: root,
-        });
+        commands
+            .entity(entity)
+            .insert((AnimationTargetId::from_names(path.iter()), AnimatedBy(root)));
 
         let Some(kids) = maybe_kids else { return };
         for &kid in kids {
