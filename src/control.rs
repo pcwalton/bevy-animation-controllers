@@ -56,23 +56,28 @@ pub enum AnimationTransitionMode {
 }
 
 pub fn update_animation_controllers<A: AnimationControl + Component<Mutability = Mutable>>(
-    mut q_characters: Query<(Entity, &mut A, &Children)>,
+    mut q_characters: Query<(Entity, &mut A)>,
     mut q_rigs: Query<(
         &mut PlayingAnimations,
         &mut AnimationPlayer,
         &RetargetedAnimations,
     )>,
+    children: Query<&Children>,
     animation_blend_assets: Res<Assets<AnimationBlendAsset>>,
     param: StaticSystemParam<A::SystemParam>,
 ) {
-    for (entity, mut animated_character, children) in &mut q_characters {
-        let Some(rig) = children.iter().cloned().find(|&kid| q_rigs.contains(kid)) else {
+    for (entity, mut animated_character) in &mut q_characters {
+        let Some(rig) = children
+            .iter_descendants(entity)
+            .find(|&kid| q_rigs.contains(kid))
+        else {
             error!(
                 "Couldn't find character meshes for {:?}",
                 any::type_name::<A>()
             );
             continue;
         };
+
         let Ok((mut animation_controller, mut animation_player, retargeted_animations)) =
             q_rigs.get_mut(rig)
         else {
@@ -94,9 +99,14 @@ pub fn update_animation_controllers<A: AnimationControl + Component<Mutability =
             }
             any_dirty = true;
 
-            let (Some(new_animation_blend), animation_transition_time) =
-                A::animation_for_state(layer, &new_animation_state, &param)
-            else {
+            debug!("Animation action: {:?}", animation_action);
+
+            let (new_animation_blend_opt, animation_transition_time) =
+                A::animation_for_state(layer, &new_animation_state, &param);
+            let Some(new_animation_blend) = new_animation_blend_opt else {
+                animation_controller
+                    .group_mut(layer)
+                    .stop(&mut animation_player, animation_transition_time);
                 continue;
             };
             let Some(RetargetedAnimation { nodes, repeat }) =

@@ -121,6 +121,21 @@ impl LayerAnimations {
         }
     }
 
+    /// Fades out whatever is currently playing on this layer, leaving
+    /// `main_animation` as `None` afterward instead of just decaying to zero
+    /// weight with nothing tracked. Use this (rather than simply letting a
+    /// layer's weight lapse) whenever a layer should genuinely go quiet -
+    /// e.g. holstering a weapon and dropping the upper-body layer back to
+    /// nothing rather than switching to another pose.
+    ///
+    /// Pass [`Duration::ZERO`] to stop instantly.
+    pub fn stop(&mut self, player: &mut AnimationPlayer, transition_duration: Duration) {
+        let Some(old_playing_animation) = self.main_animation.take() else {
+            return;
+        };
+        self.fade_out_or_stop(player, &old_playing_animation, transition_duration);
+    }
+
     fn transition_away_from_old_animation(
         &mut self,
         player: &mut AnimationPlayer,
@@ -130,7 +145,15 @@ impl LayerAnimations {
         let Some(old_playing_animation) = self.main_animation.replace(new_animation) else {
             return;
         };
+        self.fade_out_or_stop(player, &old_playing_animation, transition_duration);
+    }
 
+    fn fade_out_or_stop(
+        &mut self,
+        player: &mut AnimationPlayer,
+        old_playing_animation: &PlayingAnimation,
+        transition_duration: Duration,
+    ) {
         for old_playing_animation_node in old_playing_animation.nodes.iter() {
             if transition_duration.is_zero() {
                 // Immediately stop the old animation.
@@ -140,7 +163,6 @@ impl LayerAnimations {
             }
 
             // Enqueue a transition.
-            // FIXME: Is this right?
             let Some(old_animation) = player.animation_mut(*old_playing_animation_node) else {
                 info!(
                     "Couldn't find active animation for {:?}",
@@ -156,12 +178,13 @@ impl LayerAnimations {
                 continue;
             }
             trace!(
-                "Enqueuing transition from {:?}",
+                "Enqueuing fade-out transition from {:?}",
                 *old_playing_animation_node
             );
+            let starting_weight = old_animation.weight();
             self.transitions.push(TransitioningAnimation {
-                current_weight: old_animation.weight(),
-                weight_decline_per_sec: 1.0 / transition_duration.as_secs_f32(),
+                current_weight: starting_weight,
+                weight_decline_per_sec: starting_weight / transition_duration.as_secs_f32(),
                 animation: *old_playing_animation_node,
             });
         }
@@ -217,49 +240,19 @@ impl LayerAnimations {
                     weight
                 );
 
-                player
-                    .start(new_animation.nodes[prev_index])
-                    .set_repeat(repeat)
-                    .set_weight(1.0 - weight);
+                player.start(new_animation.nodes[prev_index]).set_repeat(repeat);
 
                 if let Some(next_index) = next_index {
-                    player
-                        .start(new_animation.nodes[next_index])
-                        .set_repeat(repeat)
-                        .set_weight(weight);
+                    player.start(new_animation.nodes[next_index]).set_repeat(repeat);
                 }
             }
 
             AnimationBlend::Blend {
-                blend: blend_id,
-                time: AnimationBlendTime::Blend2d(time),
+                blend: _,
+                time: AnimationBlendTime::Blend2d(_),
             } => {
-                let Some(blend) = animation_blend_assets.get(blend_id) else {
-                    warn!(
-                        "Couldn't start playing new 2D blend {:?} because the blend asset didn't \
-                         exist",
-                        blend_id
-                    );
-                    return;
-                };
-                let AnimationBlendAssetType::Blend2d {
-                    ref rings,
-                    center: _,
-                } = blend.blend_type
-                else {
-                    warn!(
-                        "Couldn't start playing new 2D blend {:?} because the blend asset wasn't a \
-                         2D blend",
-                        blend_id
-                    );
-                    return;
-                };
-
-                let weights =
-                    interpolation::polar_bilinear_interpolate(rings, &new_animation.nodes, time);
-
-                for (&node, weight) in new_animation.nodes.iter().zip(weights.iter()) {
-                    player.start(node).set_repeat(repeat).set_weight(*weight);
+                for &node in new_animation.nodes.iter() {
+                    player.start(node).set_repeat(repeat);
                 }
             }
         }
@@ -343,16 +336,20 @@ impl LayerAnimations {
                     weight
                 );
 
-                player
-                    .play(new_animation.nodes[prev_index])
-                    .set_repeat(repeat)
-                    .set_weight(1.0 - weight);
+                // Only ensure the right nodes are actively playing here.
+                // Weight is deliberately NOT set: distribute_weight (called
+                // from advance_transitions later this same frame) is the
+                // single source of truth for weight, since it correctly
+                // accounts for remaining_weight from any in-flight fade on
+                // this layer. Setting weight here too was pure duplicate
+                // work - the same interpolation ran twice per frame, and
+                // whichever transitions happened to be in flight would
+                // briefly see the wrong (un-scaled) weight from this call
+                // before distribute_weight corrected it moments later.
+                player.play(new_animation.nodes[prev_index]).set_repeat(repeat);
 
                 if let Some(next_index) = next_index {
-                    player
-                        .play(new_animation.nodes[next_index])
-                        .set_repeat(repeat)
-                        .set_weight(weight);
+                    player.play(new_animation.nodes[next_index]).set_repeat(repeat);
                 }
             }
 
@@ -377,7 +374,7 @@ impl LayerAnimations {
                             blend: ref mut playing_blend,
                             time: AnimationBlendTime::Blend2d(ref mut playing_time),
                         },
-                    ref label,
+                    label: _,
                 },
             ) => {
                 if new_blend != *playing_blend {
@@ -385,37 +382,16 @@ impl LayerAnimations {
                     return;
                 }
 
-                let Some(blend) = animation_blend_assets.get(new_blend) else {
-                    warn!(
-                        "Couldn't start playing new 2D blend {:?} because the blend asset didn't \
-                         exist",
-                        label,
-                    );
-                    return;
-                };
-                let AnimationBlendAssetType::Blend2d {
-                    ref rings,
-                    center: _,
-                } = blend.blend_type
-                else {
-                    warn!(
-                        "Couldn't start playing new 2D blend {:?} because the blend asset wasn't a \
-                         2D blend",
-                        new_blend
-                    );
-                    return;
-                };
-
                 *playing_time = new_time;
 
-                let weights = interpolation::polar_bilinear_interpolate(
-                    rings,
-                    &new_animation.nodes,
-                    new_time,
-                );
-
-                for (node, weight) in new_animation.nodes.iter().zip(weights.iter()) {
-                    player.play(*node).set_repeat(repeat).set_weight(*weight);
+                // Only ensure nodes are playing here - don't compute weights
+                // at all. distribute_weight (via advance_transitions, later
+                // this same frame) is the single place polar_bilinear_interpolate
+                // runs and weight gets set; running it here too was pure
+                // duplicate work, with a transient-wrong-weight risk while a
+                // transition was in flight on this layer.
+                for node in new_animation.nodes.iter() {
+                    player.play(*node).set_repeat(repeat);
                 }
             }
 
@@ -444,9 +420,10 @@ pub fn advance_transitions(
     // is divided between all the other layers, eventually culminating in the
     // currently-playing animation receiving whatever's left. This results in a
     // nicely normalized weight.
-    let mut remaining_weight = 1.0;
     for (mut animation_controller, mut player) in q_animations.iter_mut() {
         for animation_group_controller in animation_controller.layers.iter_mut() {
+            // Each independent AnimationLayer gets its own 1.0 weight budget.
+            let mut remaining_weight = 1.0;
             for transition in &mut animation_group_controller.transitions.iter_mut().rev() {
                 // Decrease weight.
                 transition.current_weight = (transition.current_weight
@@ -467,7 +444,6 @@ pub fn advance_transitions(
 
             // Distribute remaining weight.
             //
-            // FIXME: This evaluates animations twice! Such a botch!
             if let Some(main_animation) = &animation_group_controller.main_animation {
                 distribute_weight(
                     &mut player,
