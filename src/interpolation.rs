@@ -2,7 +2,7 @@
 
 use bevy::{animation::graph::AnimationNodeIndex, math::Vec2};
 use smallvec::{SmallVec, smallvec};
-use std::{cmp::Ordering, f32::consts::PI};
+use std::{cmp::Ordering, f32::consts::{TAU}};
 
 use crate::{AnimationBlendAssetRing2d, AnimationBlendAssetStop1d, LinearInterpolationWeights};
 
@@ -20,22 +20,16 @@ pub fn polar_bilinear_interpolate(
     nodes: &[AnimationNodeIndex],
     time: Vec2,
 ) -> SmallVec<[f32; INLINE_ANIMATION_BLENDS]> {
-    // FIXME(pcwalton): This could be a fixed array of length 2.
-    let mut first_stop_in_each_ring = Vec::with_capacity(rings.len() + 1);
-    first_stop_in_each_ring.push(1);
+    let mut first_stop_in_each_ring: SmallVec<[usize; 2]> = smallvec![1];
     for ring in rings {
         let first_stop_in_this_ring = *first_stop_in_each_ring.last().unwrap() + ring.stops.len();
         first_stop_in_each_ring.push(first_stop_in_this_ring);
     }
 
-    let mut next_ring_index = None;
-    for (ring_index, ring) in rings.iter().enumerate() {
-        if time.x < ring.time {
-            next_ring_index = Some(ring_index);
-            break;
-        }
-    }
-    let next_ring_index = next_ring_index.unwrap_or(rings.len());
+    let next_ring_index = rings
+        .iter()
+        .position(|ring| time.x < ring.time)
+        .unwrap_or(rings.len());
 
     let next_weights = rings.get(next_ring_index).map(|ring| {
         (
@@ -64,11 +58,11 @@ pub fn polar_bilinear_interpolate(
         }
         (None, Some((next_weights, first_stop_in_next_ring))) => {
             let radius_time = time.x / rings[0].time;
-            weights[0] = radius_time;
+            weights[0] = 1.0 - radius_time;
             weights[first_stop_in_next_ring + next_weights.prev_stop_index] =
-                (1.0 - radius_time) * (1.0 - next_weights.time);
+                radius_time * (1.0 - next_weights.time);
             weights[first_stop_in_next_ring + next_weights.next_stop_index] =
-                (1.0 - radius_time) * next_weights.time;
+                radius_time * next_weights.time;
         }
         (
             Some((prev_weights, first_stop_in_prev_ring)),
@@ -81,13 +75,13 @@ pub fn polar_bilinear_interpolate(
                 time.x,
             );
             weights[first_stop_in_prev_ring + prev_weights.prev_stop_index] =
-                radius_time * (1.0 - prev_weights.time);
+                (1.0 - radius_time) * (1.0 - prev_weights.time);
             weights[first_stop_in_prev_ring + prev_weights.next_stop_index] =
-                radius_time * prev_weights.time;
+                (1.0 - radius_time) * prev_weights.time;
             weights[first_stop_in_next_ring + next_weights.prev_stop_index] =
-                (1.0 - radius_time) * (1.0 - next_weights.time);
+                radius_time * (1.0 - next_weights.time);
             weights[first_stop_in_next_ring + next_weights.next_stop_index] =
-                (1.0 - radius_time) * next_weights.time;
+                radius_time * next_weights.time;
         }
     }
 
@@ -103,12 +97,12 @@ fn linear_interpolate_ring(
     if ring.stops.len() == 1 {
         return LinearInterpolationWeights {
             prev_stop_index: 0,
-            next_stop_index: 1,
-            time: 0.0,
+            next_stop_index: 0,
+            time: 1.0,
         };
     }
 
-    let time = time.rem_euclid(2.0 * PI);
+    let mut time = time.rem_euclid(TAU);
 
     let mut next_stop_index = match ring
         .stops
@@ -129,7 +123,10 @@ fn linear_interpolate_ring(
     let prev_time = ring.stops[prev_stop_index].time;
     let mut next_time = ring.stops[next_stop_index].time;
     if next_time < prev_time {
-        next_time += 2.0 * PI;
+        next_time += TAU;
+    }
+    if time < prev_time {
+        time += TAU;
     }
 
     let time = linstep(prev_time, next_time, time);
@@ -147,13 +144,7 @@ pub fn linearly_interpolate_data(
 ) -> InterpolationResult {
     debug_assert!(!stops.is_empty());
 
-    let mut next_point_index = None;
-    for (point_index, point) in stops.iter().enumerate() {
-        if time < point.time {
-            next_point_index = Some(point_index);
-            break;
-        }
-    }
+    let next_point_index = stops.iter().position(|point| time < point.time);
 
     match next_point_index {
         Some(0) => {
